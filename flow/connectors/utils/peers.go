@@ -22,8 +22,8 @@ func CreatePeerNoValidate(
 	peerType := peer.Type
 	wrongConfigResponse := &protos.CreatePeerResponse{
 		Status: protos.CreatePeerStatus_FAILED,
-		Message: fmt.Sprintf("invalid config for %s peer %s",
-			peerType, peer.Name),
+		Message: fmt.Sprintf("invalid config for %s peer %s: %T",
+			peerType, peer.Name, config),
 	}
 	var innerConfig proto.Message
 	switch peerType {
@@ -57,6 +57,12 @@ func CreatePeerNoValidate(
 			return wrongConfigResponse, nil
 		}
 		innerConfig = s3ConfigObject.S3Config
+	case protos.DBType_MYSQL:
+		myConfigObject, ok := config.(*protos.Peer_MysqlConfig)
+		if !ok {
+			return wrongConfigResponse, nil
+		}
+		innerConfig = myConfigObject.MysqlConfig
 	case protos.DBType_CLICKHOUSE:
 		chConfigObject, ok := config.(*protos.Peer_ClickhouseConfig)
 		if !ok {
@@ -98,7 +104,7 @@ func CreatePeerNoValidate(
 		return nil, encodingErr
 	}
 
-	encryptedConfig, keyID, err := encryptPeerOptions(encodedConfig)
+	encryptedConfig, keyID, err := encryptPeerOptions(ctx, encodedConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt peer configuration: %w", err)
 	}
@@ -128,8 +134,8 @@ func CreatePeerNoValidate(
 	}, nil
 }
 
-func encryptPeerOptions(peerOptions []byte) ([]byte, string, error) {
-	key, err := peerdbenv.PeerDBCurrentEncKey()
+func encryptPeerOptions(ctx context.Context, peerOptions []byte) ([]byte, string, error) {
+	key, err := peerdbenv.PeerDBCurrentEncKey(ctx)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to get current encryption key: %w", err)
 	}

@@ -1,6 +1,11 @@
 'use client';
 
 import { TableMapRow } from '@/app/dto/MirrorsDTO';
+import {
+  TableEngine,
+  tableEngineFromJSON,
+  TableMapping,
+} from '@/grpc_generated/flow';
 import { DBType } from '@/grpc_generated/peers';
 import { Checkbox } from '@/lib/Checkbox';
 import { Icon } from '@/lib/Icon';
@@ -22,11 +27,17 @@ import { fetchColumns, fetchTables } from '../handlers';
 import ColumnBox from './columnbox';
 import { SchemaSettings } from './schemasettings';
 import {
+  columnBoxDividerStyle,
+  engineOptionStyles,
   expandableStyle,
   schemaBoxStyle,
   tableBoxStyle,
   tooltipStyle,
 } from './styles';
+
+import { Divider } from '@tremor/react';
+import ReactSelect from 'react-select';
+import SelectSortingKeys from './sortingkey';
 
 interface SchemaBoxProps {
   sourcePeer: string;
@@ -38,10 +49,11 @@ interface SchemaBoxProps {
     SetStateAction<{ tableName: string; columns: string[] }[]>
   >;
   peerType?: DBType;
-  omitAdditionalTables: string[] | undefined;
+  alreadySelectedTables: TableMapping[] | undefined;
+  initialLoadOnly?: boolean;
 }
 
-const SchemaBox = ({
+export default function SchemaBox({
   sourcePeer,
   peerType,
   schema,
@@ -49,15 +61,15 @@ const SchemaBox = ({
   setRows,
   tableColumns,
   setTableColumns,
-  omitAdditionalTables,
-}: SchemaBoxProps) => {
+  alreadySelectedTables,
+  initialLoadOnly,
+}: SchemaBoxProps) {
   const [tablesLoading, setTablesLoading] = useState(false);
   const [columnsLoading, setColumnsLoading] = useState(false);
   const [expandedSchemas, setExpandedSchemas] = useState<string[]>([]);
   const [tableQuery, setTableQuery] = useState<string>('');
   const [defaultTargetSchema, setDefaultTargetSchema] =
     useState<string>(schema);
-
   const searchedTables = useMemo(() => {
     const tableQueryLower = tableQuery.toLowerCase();
     return rows
@@ -71,18 +83,10 @@ const SchemaBox = ({
 
   const schemaIsExpanded = useCallback(
     (schema: string) => {
-      return !!expandedSchemas.find((schemaName) => schemaName === schema);
+      return expandedSchemas.some((schemaName) => schemaName === schema);
     },
     [expandedSchemas]
   );
-
-  const handleAddRow = (source: string) => {
-    const newRows = [...rows];
-    const index = newRows.findIndex((row) => row.source === source);
-    if (index >= 0) newRows[index] = { ...newRows[index], selected: true };
-    setRows(newRows);
-    addTableColumns(source);
-  };
 
   const handleRemoveRow = (source: string) => {
     const newRows = [...rows];
@@ -96,24 +100,42 @@ const SchemaBox = ({
     on ? handleAddRow(source) : handleRemoveRow(source);
   };
 
-  const updateDestination = (source: string, dest: string) => {
+  const updateDestination = (source: string, destination: string) => {
     const newRows = [...rows];
     const index = newRows.findIndex((row) => row.source === source);
-    newRows[index] = { ...newRows[index], destination: dest };
+    newRows[index] = { ...newRows[index], destination };
     setRows(newRows);
   };
 
-  const addTableColumns = (table: string) => {
-    const schemaName = table.split('.')[0];
-    const tableName = table.split('.')[1];
+  const updateEngine = (source: string, engine: TableEngine) => {
+    const newRows = [...rows];
+    const index = newRows.findIndex((row) => row.source === source);
+    newRows[index] = { ...newRows[index], engine };
+    setRows(newRows);
+  };
 
-    fetchColumns(sourcePeer, schemaName, tableName, setColumnsLoading).then(
-      (res) => {
-        setTableColumns((prev) => {
-          return [...prev, { tableName: table, columns: res }];
-        });
-      }
-    );
+  const addTableColumns = useCallback(
+    (table: string) => {
+      const schemaName = table.split('.')[0];
+      const tableName = table.split('.')[1];
+
+      fetchColumns(sourcePeer, schemaName, tableName, setColumnsLoading).then(
+        (res) => {
+          setTableColumns((prev) => {
+            return [...prev, { tableName: table, columns: res }];
+          });
+        }
+      );
+    },
+    [sourcePeer, setTableColumns]
+  );
+
+  const handleAddRow = (source: string) => {
+    const newRows = [...rows];
+    const index = newRows.findIndex((row) => row.source === source);
+    if (index >= 0) newRows[index] = { ...newRows[index], selected: true };
+    setRows(newRows);
+    addTableColumns(source);
   };
 
   const removeTableColumns = (table: string) => {
@@ -164,30 +186,56 @@ const SchemaBox = ({
   const fetchTablesForSchema = useCallback(
     (schemaName: string) => {
       setTablesLoading(true);
-      fetchTables(sourcePeer, schemaName, defaultTargetSchema, peerType).then(
-        (newRows) => {
-          for (const row of newRows) {
-            if (omitAdditionalTables?.includes(row.source)) {
-              row.canMirror = false;
-            }
+      fetchTables(
+        sourcePeer,
+        schemaName,
+        defaultTargetSchema,
+        peerType,
+        initialLoadOnly
+      ).then((newRows) => {
+        for (const row of newRows) {
+          if (
+            alreadySelectedTables
+              ?.map((tableMap) => tableMap.sourceTableIdentifier)
+              .includes(row.source)
+          ) {
+            row.selected = true;
+            row.editingDisabled = true;
+            row.destination =
+              alreadySelectedTables?.find(
+                (tableMap) => tableMap.sourceTableIdentifier === row.source
+              )?.destinationTableIdentifier ?? '';
+            addTableColumns(row.source);
           }
-          setRows((oldRows) => {
-            const filteredRows = oldRows.filter(
-              (oldRow) => oldRow.schema !== schemaName
-            );
-            const updatedRows = [...filteredRows, ...newRows];
-            return updatedRows;
-          });
-          setTablesLoading(false);
         }
-      );
+        setRows((oldRows) => {
+          const filteredRows = oldRows.filter(
+            (oldRow) => oldRow.schema !== schemaName
+          );
+          return [...filteredRows, ...newRows];
+        });
+        setTablesLoading(false);
+      });
     },
-    [setRows, sourcePeer, defaultTargetSchema, peerType, omitAdditionalTables]
+    [
+      setRows,
+      sourcePeer,
+      defaultTargetSchema,
+      peerType,
+      alreadySelectedTables,
+      addTableColumns,
+      initialLoadOnly,
+    ]
   );
+
+  const engineOptions = [
+    { value: 'CH_ENGINE_REPLACING_MERGE_TREE', label: 'ReplacingMergeTree' },
+    { value: 'CH_ENGINE_MERGE_TREE', label: 'MergeTree' },
+  ];
 
   useEffect(() => {
     fetchTablesForSchema(schema);
-  }, [schema, fetchTablesForSchema]);
+  }, [schema, fetchTablesForSchema, initialLoadOnly]);
 
   return (
     <div style={schemaBoxStyle}>
@@ -239,10 +287,12 @@ const SchemaBox = ({
                 return (
                   <div key={row.source} style={tableBoxStyle}>
                     <div
+                      className='ml-5'
                       style={{
                         display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
+                        //alignItems: 'center',
+                        flexDirection: 'column',
+                        rowGap: '1rem',
                       }}
                     >
                       <RowWithCheckbox
@@ -286,46 +336,123 @@ const SchemaBox = ({
                       />
                       <div
                         style={{
-                          width: '40%',
-                          display: row.selected ? 'block' : 'none',
+                          rowGap: '0.5rem',
+                          width: '80%',
+                          columnGap: '3rem',
+                          display: row.selected ? 'flex' : 'none',
                         }}
                         key={row.source}
                       >
-                        <p style={{ fontSize: 12 }}>Target Table:</p>
-                        <TextField
-                          key={row.source}
-                          style={{
-                            fontSize: 12,
-                            marginTop: '0.5rem',
-                            cursor: 'pointer',
-                          }}
-                          variant='simple'
-                          placeholder={'Enter target table'}
-                          value={row.destination}
-                          onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                            updateDestination(row.source, e.target.value)
-                          }
-                        />
+                        <div style={{ width: '40%' }}>
+                          <p style={{ fontSize: 12 }}>Target Table:</p>
+                          <TextField
+                            key={row.source}
+                            disabled={row.editingDisabled}
+                            style={{
+                              fontSize: 12,
+                              marginTop: '0.5rem',
+                              cursor: 'pointer',
+                            }}
+                            variant='simple'
+                            placeholder='Enter target table'
+                            value={row.destination}
+                            onChange={(
+                              e: React.ChangeEvent<HTMLInputElement>
+                            ) => updateDestination(row.source, e.target.value)}
+                          />
+                        </div>
+
+                        {peerType?.toString() ===
+                          DBType[DBType.CLICKHOUSE].toString() && (
+                          <div style={{ width: '40%' }}>
+                            <p style={{ fontSize: 12, marginBottom: '0.5rem' }}>
+                              Engine:
+                            </p>
+                            <ReactSelect
+                              styles={engineOptionStyles}
+                              options={engineOptions}
+                              placeholder='ReplacingMergeTree (default)'
+                              onChange={(selectedOption) =>
+                                selectedOption &&
+                                updateEngine(
+                                  row.source,
+                                  tableEngineFromJSON(selectedOption.value)
+                                )
+                              }
+                            />
+                          </div>
+                        )}
                       </div>
                     </div>
 
                     {/* COLUMN BOX */}
                     {row.selected && (
-                      <div className='ml-5' style={{ width: '100%' }}>
-                        <Label
-                          as='label'
-                          colorName='lowContrast'
-                          style={{ fontSize: 13 }}
+                      <div className='ml-5 mt-3' style={{ width: '100%' }}>
+                        <Divider style={columnBoxDividerStyle} />
+
+                        <div
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            rowGap: '0.5rem',
+                            width: '100%',
+                          }}
                         >
-                          Columns
-                        </Label>
+                          <Label
+                            as='label'
+                            colorName='lowContrast'
+                            style={{ fontSize: 13 }}
+                          >
+                            Columns
+                          </Label>
+                        </div>
                         {columns ? (
-                          <ColumnBox
-                            columns={columns}
-                            tableRow={row}
-                            rows={rows}
-                            setRows={setRows}
-                          />
+                          <>
+                            <ColumnBox
+                              columns={columns}
+                              tableRow={row}
+                              rows={rows}
+                              setRows={setRows}
+                              disabled={row.editingDisabled}
+                              showOrdering={
+                                peerType?.toString() ===
+                                DBType[DBType.CLICKHOUSE].toString()
+                              }
+                            />
+                            {peerType?.toString() ===
+                              DBType[DBType.CLICKHOUSE].toString() && (
+                              <div
+                                style={{
+                                  width: '50%',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  rowGap: '0.5rem',
+                                }}
+                              >
+                                <Divider
+                                  style={{
+                                    ...columnBoxDividerStyle,
+                                    marginTop: '0.5rem',
+                                  }}
+                                />
+                                <SelectSortingKeys
+                                  columns={
+                                    columns?.map((column) => {
+                                      const [
+                                        columnName,
+                                        columnType,
+                                        isPkeyStr,
+                                      ] = column.split(':');
+                                      return columnName;
+                                    }) ?? []
+                                  }
+                                  loading={columnsLoading}
+                                  tableRow={row}
+                                  setRows={setRows}
+                                />
+                              </div>
+                            )}
+                          </>
                         ) : columnsLoading ? (
                           <BarLoader />
                         ) : (
@@ -358,6 +485,4 @@ const SchemaBox = ({
       </div>
     </div>
   );
-};
-
-export default SchemaBox;
+}

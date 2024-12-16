@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/PeerDB-io/peer-flow/connectors"
 	connpostgres "github.com/PeerDB-io/peer-flow/connectors/postgres"
@@ -16,6 +17,8 @@ func (h *FlowRequestHandler) ValidatePeer(
 	ctx context.Context,
 	req *protos.ValidatePeerRequest,
 ) (*protos.ValidatePeerResponse, error) {
+	ctx, cancelCtx := context.WithTimeout(ctx, time.Minute)
+	defer cancelCtx()
 	if req.Peer == nil {
 		return &protos.ValidatePeerResponse{
 			Status:  protos.ValidatePeerStatus_INVALID,
@@ -30,7 +33,7 @@ func (h *FlowRequestHandler) ValidatePeer(
 		}, nil
 	}
 
-	conn, err := connectors.GetConnector(ctx, req.Peer)
+	conn, err := connectors.GetConnector(ctx, nil, req.Peer)
 	if err != nil {
 		displayErr := fmt.Sprintf("%s peer %s was invalidated: %v", req.Peer.Type, req.Peer.Name, err)
 		h.alerter.LogNonFlowWarning(ctx, telemetry.CreatePeer, req.Peer.Name, displayErr)

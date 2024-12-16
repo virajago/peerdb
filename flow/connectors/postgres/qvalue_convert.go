@@ -62,10 +62,14 @@ func (c *PostgresConnector) postgresOIDToQValueKind(recvOID uint32) qvalue.QValu
 		return qvalue.QValueKindString
 	case pgtype.ByteaOID:
 		return qvalue.QValueKindBytes
-	case pgtype.JSONOID, pgtype.JSONBOID:
+	case pgtype.JSONOID:
 		return qvalue.QValueKindJSON
+	case pgtype.JSONBOID:
+		return qvalue.QValueKindJSONB
 	case pgtype.UUIDOID:
 		return qvalue.QValueKindUUID
+	case pgtype.UUIDArrayOID:
+		return qvalue.QValueKindArrayUUID
 	case pgtype.TimeOID:
 		return qvalue.QValueKindTime
 	case pgtype.DateOID:
@@ -104,8 +108,14 @@ func (c *PostgresConnector) postgresOIDToQValueKind(recvOID uint32) qvalue.QValu
 		return qvalue.QValueKindArrayTimestampTZ
 	case pgtype.TextArrayOID, pgtype.VarcharArrayOID, pgtype.BPCharArrayOID:
 		return qvalue.QValueKindArrayString
+	case pgtype.JSONArrayOID:
+		return qvalue.QValueKindArrayJSON
+	case pgtype.JSONBArrayOID:
+		return qvalue.QValueKindArrayJSONB
 	case pgtype.IntervalOID:
 		return qvalue.QValueKindInterval
+	case pgtype.TstzrangeOID:
+		return qvalue.QValueKindTSTZRange
 	default:
 		typeName, ok := pgtype.NewMap().TypeForOID(recvOID)
 		if !ok {
@@ -161,10 +171,14 @@ func qValueKindToPostgresType(colTypeStr string) string {
 		return "BYTEA"
 	case qvalue.QValueKindJSON:
 		return "JSON"
+	case qvalue.QValueKindJSONB:
+		return "JSONB"
 	case qvalue.QValueKindHStore:
 		return "HSTORE"
 	case qvalue.QValueKindUUID:
 		return "UUID"
+	case qvalue.QValueKindArrayUUID:
+		return "UUID[]"
 	case qvalue.QValueKindTime:
 		return "TIME"
 	case qvalue.QValueKindTimeTZ:
@@ -203,6 +217,10 @@ func qValueKindToPostgresType(colTypeStr string) string {
 		return "BOOLEAN[]"
 	case qvalue.QValueKindArrayString:
 		return "TEXT[]"
+	case qvalue.QValueKindArrayJSON:
+		return "JSON[]"
+	case qvalue.QValueKindArrayJSONB:
+		return "JSONB[]"
 	case qvalue.QValueKindGeography:
 		return "GEOGRAPHY"
 	case qvalue.QValueKindGeometry:
@@ -214,12 +232,60 @@ func qValueKindToPostgresType(colTypeStr string) string {
 	}
 }
 
-func parseJSON(value interface{}) (qvalue.QValue, error) {
+func parseJSON(value interface{}, isArray bool) (qvalue.QValue, error) {
 	jsonVal, err := json.Marshal(value)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse JSON: %w", err)
 	}
-	return qvalue.QValueJSON{Val: string(jsonVal)}, nil
+	return qvalue.QValueJSON{Val: string(jsonVal), IsArray: isArray}, nil
+}
+
+func parseUUID(value interface{}) (uuid.UUID, error) {
+	switch v := value.(type) {
+	case string:
+		return uuid.Parse(v)
+	case [16]byte:
+		return uuid.UUID(v), nil
+	case uuid.UUID:
+		return v, nil
+	default:
+		return uuid.UUID{}, fmt.Errorf("unsupported type for UUID: %T", value)
+	}
+}
+
+func parseUUIDArray(value interface{}) (qvalue.QValue, error) {
+	switch v := value.(type) {
+	case []string:
+		uuids := make([]uuid.UUID, 0, len(v))
+		for _, s := range v {
+			id, err := uuid.Parse(s)
+			if err != nil {
+				return nil, fmt.Errorf("invalid UUID in array: %w", err)
+			}
+			uuids = append(uuids, id)
+		}
+		return qvalue.QValueArrayUUID{Val: uuids}, nil
+	case [][16]byte:
+		uuids := make([]uuid.UUID, 0, len(v))
+		for _, v := range v {
+			uuids = append(uuids, uuid.UUID(v))
+		}
+		return qvalue.QValueArrayUUID{Val: uuids}, nil
+	case []uuid.UUID:
+		return qvalue.QValueArrayUUID{Val: v}, nil
+	case []interface{}:
+		uuids := make([]uuid.UUID, 0, len(v))
+		for _, v := range v {
+			id, err := parseUUID(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid UUID interface{} value in array: %w", err)
+			}
+			uuids = append(uuids, id)
+		}
+		return qvalue.QValueArrayUUID{Val: uuids}, nil
+	default:
+		return nil, fmt.Errorf("unsupported type for UUID array: %T", value)
+	}
 }
 
 func convertToArray[T any](kind qvalue.QValueKind, value interface{}) ([]T, error) {
@@ -277,6 +343,31 @@ func parseFieldFromQValueKind(qvalueKind qvalue.QValueKind, value interface{}) (
 		}
 
 		return qvalue.QValueString{Val: string(intervalJSON)}, nil
+	case qvalue.QValueKindTSTZRange:
+		tstzrangeObject := value.(pgtype.Range[interface{}])
+		lowerBoundType := tstzrangeObject.LowerType
+		upperBoundType := tstzrangeObject.UpperType
+		lowerTime, err := convertTimeRangeBound(tstzrangeObject.Lower)
+		if err != nil {
+			return nil, fmt.Errorf("[tstzrange]error for lower time bound: %w", err)
+		}
+
+		upperTime, err := convertTimeRangeBound(tstzrangeObject.Upper)
+		if err != nil {
+			return nil, fmt.Errorf("[tstzrange]error for upper time bound: %w", err)
+		}
+
+		lowerBracket := "["
+		if lowerBoundType == pgtype.Exclusive {
+			lowerBracket = "("
+		}
+		upperBracket := "]"
+		if upperBoundType == pgtype.Exclusive {
+			upperBracket = ")"
+		}
+		tstzrangeStr := fmt.Sprintf("%s%v,%v%s",
+			lowerBracket, lowerTime, upperTime, upperBracket)
+		return qvalue.QValueTSTZRange{Val: tstzrangeStr}, nil
 	case qvalue.QValueKindDate:
 		switch val := value.(type) {
 		case time.Time:
@@ -306,10 +397,16 @@ func parseFieldFromQValueKind(qvalueKind qvalue.QValueKind, value interface{}) (
 	case qvalue.QValueKindBoolean:
 		boolVal := value.(bool)
 		return qvalue.QValueBoolean{Val: boolVal}, nil
-	case qvalue.QValueKindJSON:
-		tmp, err := parseJSON(value)
+	case qvalue.QValueKindJSON, qvalue.QValueKindJSONB:
+		tmp, err := parseJSON(value, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse JSON: %w", err)
+		}
+		return tmp, nil
+	case qvalue.QValueKindArrayJSON, qvalue.QValueKindArrayJSONB:
+		tmp, err := parseJSON(value, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse JSON Array: %w", err)
 		}
 		return tmp, nil
 	case qvalue.QValueKindInt16:
@@ -333,18 +430,17 @@ func parseFieldFromQValueKind(qvalueKind qvalue.QValueKind, value interface{}) (
 		// handling all unsupported types with strings as well for now.
 		return qvalue.QValueString{Val: fmt.Sprint(value)}, nil
 	case qvalue.QValueKindUUID:
-		switch v := value.(type) {
-		case string:
-			id, err := uuid.Parse(v)
-			if err != nil {
-				return nil, fmt.Errorf("failed to parse UUID: %w", err)
-			}
-			return qvalue.QValueUUID{Val: [16]byte(id)}, nil
-		case [16]byte:
-			return qvalue.QValueUUID{Val: v}, nil
-		default:
-			return nil, fmt.Errorf("failed to parse UUID: %v", value)
+		tmp, err := parseUUID(value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse UUID: %w", err)
 		}
+		return qvalue.QValueUUID{Val: tmp}, nil
+	case qvalue.QValueKindArrayUUID:
+		tmp, err := parseUUIDArray(value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse UUID array: %w", err)
+		}
+		return tmp, nil
 	case qvalue.QValueKindINET:
 		switch v := value.(type) {
 		case string:
@@ -482,4 +578,24 @@ func customTypeToQKind(typeName string) qvalue.QValueKind {
 	default:
 		return qvalue.QValueKindString
 	}
+}
+
+// Postgres does not like timestamps of the form 2006-01-02 15:04:05 +0000 UTC
+// in tstzrange.
+// convertTimeRangeBound removes the +0000 UTC part
+func convertTimeRangeBound(timeBound interface{}) (string, error) {
+	layout := "2006-01-02 15:04:05 -0700 MST"
+	postgresFormat := "2006-01-02 15:04:05"
+	var convertedTime string
+	if timeBound != nil {
+		lowerParsed, err := time.Parse(layout, fmt.Sprint(timeBound))
+		if err != nil {
+			return "", fmt.Errorf("unexpected lower bound value in tstzrange. Error: %v", err)
+		}
+		convertedTime = lowerParsed.Format(postgresFormat)
+	} else {
+		convertedTime = ""
+	}
+
+	return convertedTime, nil
 }

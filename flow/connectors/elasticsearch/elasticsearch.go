@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -17,12 +18,10 @@ import (
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esutil"
 	"go.temporal.io/sdk/log"
-	"golang.org/x/exp/maps"
 
 	metadataStore "github.com/PeerDB-io/peer-flow/connectors/external_metadata"
 	"github.com/PeerDB-io/peer-flow/connectors/utils"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/model/qvalue"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
@@ -71,7 +70,7 @@ func NewElasticsearchConnector(ctx context.Context,
 	return &ElasticsearchConnector{
 		PostgresMetadata: pgMetadata,
 		client:           esClient,
-		logger:           logger.LoggerFromCtx(ctx),
+		logger:           shared.LoggerFromCtx(ctx),
 	}, nil
 }
 
@@ -96,7 +95,7 @@ func (esc *ElasticsearchConnector) CreateRawTable(ctx context.Context,
 }
 
 // we handle schema changes by not handling them since no mapping is being enforced right now
-func (esc *ElasticsearchConnector) ReplayTableSchemaDeltas(ctx context.Context,
+func (esc *ElasticsearchConnector) ReplayTableSchemaDeltas(ctx context.Context, env map[string]string,
 	flowJobName string, schemaDeltas []*protos.TableSchemaDelta,
 ) error {
 	return nil
@@ -131,7 +130,7 @@ func (esc *ElasticsearchConnector) SyncRecords(ctx context.Context,
 	cacheCloser := func() bool {
 		closeHasErrors := false
 		if !bulkIndexersHaveShutdown {
-			for _, esBulkIndexer := range maps.Values(esBulkIndexerCache) {
+			for esBulkIndexer := range maps.Values(esBulkIndexerCache) {
 				err := esBulkIndexer.Close(context.Background())
 				if err != nil {
 					esc.logger.Error("[es] failed to close bulk indexer", slog.Any("error", err))
@@ -147,7 +146,7 @@ func (esc *ElasticsearchConnector) SyncRecords(ctx context.Context,
 
 	flushLoopDone := make(chan struct{})
 	go func() {
-		flushTimeout, err := peerdbenv.PeerDBQueueFlushTimeoutSeconds(ctx)
+		flushTimeout, err := peerdbenv.PeerDBQueueFlushTimeoutSeconds(ctx, req.Env)
 		if err != nil {
 			esc.logger.Warn("[elasticsearch] failed to get flush timeout, no periodic flushing", slog.Any("error", err))
 			return

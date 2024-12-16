@@ -1,6 +1,6 @@
 import { PeerConfig, PeerSetter } from '@/app/dto/PeersDTO';
 import { blankBigquerySetting } from './bq';
-import { blankClickhouseSetting } from './ch';
+import { blankClickHouseSetting } from './ch';
 import { blankEventHubGroupSetting } from './eh';
 import { blankElasticsearchSetting } from './es';
 import { blankKafkaSetting } from './ka';
@@ -11,6 +11,7 @@ import { blankSnowflakeSetting } from './sf';
 
 export interface PeerSetting {
   label: string;
+  field?: string;
   stateHandler: (value: string | boolean, setter: PeerSetter) => void;
   type?: string;
   optional?: boolean;
@@ -30,7 +31,7 @@ export const getBlankSetting = (dbType: string): PeerConfig => {
     case 'BIGQUERY':
       return blankBigquerySetting;
     case 'CLICKHOUSE':
-      return blankClickhouseSetting;
+      return blankClickHouseSetting;
     case 'PUBSUB':
       return blankPubSubSetting;
     case 'KAFKA':

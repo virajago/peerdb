@@ -10,7 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
-	"github.com/yuin/gopher-lua"
+	lua "github.com/yuin/gopher-lua"
 
 	"github.com/PeerDB-io/glua64"
 	"github.com/PeerDB-io/gluabit32"
@@ -138,7 +138,7 @@ func LoadPeerdbScript(ls *lua.LState) int {
 
 	fn, err := ls.Load(bytes.NewReader(source), name)
 	if err != nil {
-		ls.RaiseError(err.Error())
+		ls.RaiseError("%s", err.Error())
 	}
 	ls.Push(fn)
 	return 1
@@ -147,7 +147,7 @@ func LoadPeerdbScript(ls *lua.LState) int {
 func GetRowQ(ls *lua.LState, row model.RecordItems, col string) qvalue.QValue {
 	qv, err := row.GetValueByColName(col)
 	if err != nil {
-		ls.RaiseError(err.Error())
+		ls.RaiseError("%s", err.Error())
 		return nil
 	}
 	return qv
@@ -241,7 +241,15 @@ func LuaRowNewIndex(ls *lua.LState) int {
 	case qvalue.QValueKindUUID:
 		if ud, ok := val.(*lua.LUserData); ok {
 			if id, ok := ud.Value.(uuid.UUID); ok {
-				newqv = qvalue.QValueUUID{Val: [16]byte(id)}
+				newqv = qvalue.QValueUUID{Val: id}
+			}
+		}
+	case qvalue.QValueKindArrayUUID:
+		if tbl, ok := val.(*lua.LTable); ok {
+			newqv = qvalue.QValueArrayUUID{
+				Val: shared.LTableToSlice(ls, tbl, func(_ *lua.LState, v lua.LValue) uuid.UUID {
+					return uuid.MustParse(lua.LVAsString(v))
+				}),
 			}
 		}
 	case qvalue.QValueKindJSON:
@@ -321,7 +329,7 @@ func LuaRowNewIndex(ls *lua.LState) int {
 			}
 		}
 	default:
-		ls.RaiseError(fmt.Sprintf("no support for reassigning %s", kind))
+		ls.RaiseError("no support for reassigning %s", kind)
 		return 0
 	}
 
@@ -533,7 +541,7 @@ func LVAsDecimal(ls *lua.LState, lv lua.LValue) decimal.Decimal {
 	case lua.LString:
 		d, err := decimal.NewFromString(string(v))
 		if err != nil {
-			ls.RaiseError(err.Error())
+			ls.RaiseError("%s", err.Error())
 		}
 		return d
 	case *lua.LUserData:

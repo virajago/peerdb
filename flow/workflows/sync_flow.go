@@ -7,18 +7,10 @@ import (
 	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
-	"golang.org/x/exp/maps"
 
 	"github.com/PeerDB-io/peer-flow/generated/protos"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/shared"
-)
-
-// For now cdc restarts sync flow whenever it itself restarts,
-// set this value high enough to never be met, relying on cdc restarts.
-// In the future cdc flow restarts could be decoupled from sync flow restarts.
-const (
-	maxSyncsPerSyncFlow = 64
 )
 
 func SyncFlowWorkflow(
@@ -74,7 +66,7 @@ func SyncFlowWorkflow(
 	})
 
 	var waitSelector workflow.Selector
-	parallel := getParallelSyncNormalize(ctx, logger)
+	parallel := getParallelSyncNormalize(ctx, logger, config.Env)
 	if !parallel {
 		waitSelector = workflow.NewNamedSelector(ctx, "NormalizeWait")
 		waitSelector.AddReceive(ctx.Done(), func(_ workflow.ReceiveChannel, _ bool) {})
@@ -87,7 +79,7 @@ func SyncFlowWorkflow(
 	}
 
 	syncFlowCtx := workflow.WithActivityOptions(syncSessionCtx, workflow.ActivityOptions{
-		StartToCloseTimeout: 72 * time.Hour,
+		StartToCloseTimeout: 7 * 24 * time.Hour,
 		HeartbeatTimeout:    time.Minute,
 		WaitForCancellation: true,
 	})
@@ -95,7 +87,6 @@ func SyncFlowWorkflow(
 		var syncDone bool
 		mustWait := waitSelector != nil
 
-		// execute the sync flow
 		currentSyncFlowNum += 1
 		logger.Info("executing sync flow", slog.Int("count", currentSyncFlowNum))
 
@@ -111,27 +102,13 @@ func SyncFlowWorkflow(
 			var childSyncFlowRes *model.SyncCompositeResponse
 			if err := f.Get(ctx, &childSyncFlowRes); err != nil {
 				logger.Error("failed to execute sync flow", slog.Any("error", err))
-				_ = model.SyncResultSignal.SignalExternalWorkflow(
-					ctx,
-					parent.ID,
-					"",
-					nil,
-				).Get(ctx, nil)
 				syncErr = true
 			} else if childSyncFlowRes != nil {
-				_ = model.SyncResultSignal.SignalExternalWorkflow(
-					ctx,
-					parent.ID,
-					"",
-					childSyncFlowRes.SyncResponse,
-				).Get(ctx, nil)
 				totalRecordsSynced += childSyncFlowRes.SyncResponse.NumRecordsSynced
-				logger.Info("Total records synced: ",
-					slog.Int64("totalRecordsSynced", totalRecordsSynced))
-
-				tableSchemaDeltasCount := len(childSyncFlowRes.SyncResponse.TableSchemaDeltas)
+				logger.Info("Total records synced", slog.Int64("totalRecordsSynced", totalRecordsSynced))
 
 				// slightly hacky: table schema mapping is cached, so we need to manually update it if schema changes.
+				tableSchemaDeltasCount := len(childSyncFlowRes.SyncResponse.TableSchemaDeltas)
 				if tableSchemaDeltasCount > 0 {
 					modifiedSrcTables := make([]string, 0, tableSchemaDeltasCount)
 					for _, tableSchemaDelta := range childSyncFlowRes.SyncResponse.TableSchemaDeltas {
@@ -141,27 +118,17 @@ func SyncFlowWorkflow(
 					getModifiedSchemaCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 						StartToCloseTimeout: 5 * time.Minute,
 					})
-					getModifiedSchemaFuture := workflow.ExecuteActivity(getModifiedSchemaCtx, flowable.GetTableSchema,
-						&protos.GetTableSchemaBatchInput{
+					getModifiedSchemaFuture := workflow.ExecuteActivity(getModifiedSchemaCtx, flowable.SetupTableSchema,
+						&protos.SetupTableSchemaBatchInput{
 							PeerName:         config.SourceName,
 							TableIdentifiers: modifiedSrcTables,
+							TableMappings:    options.TableMappings,
 							FlowName:         config.FlowJobName,
 							System:           config.System,
 						})
 
-					var getModifiedSchemaRes *protos.GetTableSchemaBatchOutput
-					if err := getModifiedSchemaFuture.Get(ctx, &getModifiedSchemaRes); err != nil {
+					if err := getModifiedSchemaFuture.Get(ctx, nil); err != nil {
 						logger.Error("failed to execute schema update at source", slog.Any("error", err))
-						_ = model.SyncResultSignal.SignalExternalWorkflow(
-							ctx,
-							parent.ID,
-							"",
-							nil,
-						).Get(ctx, nil)
-					} else {
-						processedSchemaMapping := shared.BuildProcessedSchemaMapping(options.TableMappings,
-							getModifiedSchemaRes.TableNameSchemaMapping, logger)
-						maps.Copy(options.TableNameSchemaMapping, processedSchemaMapping)
 					}
 				}
 
@@ -171,9 +138,8 @@ func SyncFlowWorkflow(
 						parent.ID,
 						"",
 						model.NormalizePayload{
-							Done:                   false,
-							SyncBatchID:            childSyncFlowRes.SyncResponse.CurrentSyncBatchID,
-							TableNameSchemaMapping: options.TableNameSchemaMapping,
+							Done:        false,
+							SyncBatchID: childSyncFlowRes.SyncResponse.CurrentSyncBatchID,
 						},
 					).Get(ctx, nil)
 					if err != nil {
@@ -195,7 +161,16 @@ func SyncFlowWorkflow(
 			break
 		}
 
-		restart := currentSyncFlowNum >= maxSyncsPerSyncFlow || syncErr
+		restart := syncErr || workflow.GetInfo(ctx).GetContinueAsNewSuggested()
+
+		if syncErr {
+			logger.Info("sync flow error, sleeping for 30 seconds...")
+			err := workflow.Sleep(ctx, 30*time.Second)
+			if err != nil {
+				logger.Error("failed to sleep", slog.Any("error", err))
+			}
+		}
+
 		if !stop && !syncErr && mustWait {
 			waitSelector.Select(ctx)
 			if restart {

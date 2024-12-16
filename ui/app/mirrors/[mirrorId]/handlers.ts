@@ -12,8 +12,10 @@ export const getMirrorState = async (
     body: JSON.stringify({
       flow_job_name,
       include_flow_info: true,
+      exclude_batches: true,
     }),
   });
+  if (!res.ok) throw res.json();
   return res.json();
 };
 
@@ -24,11 +26,13 @@ export const getCurrentIdleTimeout = async (mirrorName: string) => {
 
 export const changeFlowState = async (
   mirrorName: string,
-  flowState: FlowStatus
+  flowState: FlowStatus,
+  dropStats?: boolean
 ): Promise<Response> => {
   const req: FlowStateChangeRequest = {
     flowJobName: mirrorName,
     requestedFlowState: flowState,
+    dropMirrorStats: dropStats ?? false,
   };
   const res = await fetch('/api/v1/mirrors/state_change', {
     method: 'POST',

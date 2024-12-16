@@ -15,7 +15,6 @@ import (
 	metadataStore "github.com/PeerDB-io/peer-flow/connectors/external_metadata"
 	"github.com/PeerDB-io/peer-flow/connectors/utils"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
 	"github.com/PeerDB-io/peer-flow/pua"
@@ -35,7 +34,7 @@ func NewEventHubConnector(
 	ctx context.Context,
 	config *protos.EventHubGroupConfig,
 ) (*EventHubConnector, error) {
-	logger := logger.LoggerFromCtx(ctx)
+	logger := shared.LoggerFromCtx(ctx)
 	defaultAzureCreds, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		logger.Error("failed to get default azure credentials", "error", err)
@@ -184,7 +183,7 @@ func (c *EventHubConnector) processBatch(
 	batchPerTopic := NewHubBatches(c.hubManager)
 	toJSONOpts := model.NewToJSONOptions(c.config.UnnestColumns, false)
 
-	flushTimeout, err := peerdbenv.PeerDBQueueFlushTimeoutSeconds(ctx)
+	flushTimeout, err := peerdbenv.PeerDBQueueFlushTimeoutSeconds(ctx, req.Env)
 	if err != nil {
 		return 0, fmt.Errorf("failed to get flush timeout: %w", err)
 	}
@@ -381,7 +380,9 @@ func (c *EventHubConnector) CreateRawTable(ctx context.Context, req *protos.Crea
 	}, nil
 }
 
-func (c *EventHubConnector) ReplayTableSchemaDeltas(_ context.Context, flowJobName string, schemaDeltas []*protos.TableSchemaDelta) error {
+func (c *EventHubConnector) ReplayTableSchemaDeltas(_ context.Context, _ map[string]string,
+	flowJobName string, schemaDeltas []*protos.TableSchemaDelta,
+) error {
 	c.logger.Info("ReplayTableSchemaDeltas for event hub is a no-op")
 	return nil
 }

@@ -1,4 +1,5 @@
 'use client';
+import { TableMapping } from '@/grpc_generated/flow';
 import { DBType } from '@/grpc_generated/peers';
 import { Label } from '@/lib/Label';
 import { SearchField } from '@/lib/SearchField';
@@ -17,37 +18,41 @@ interface TableMappingProps {
   setRows: Dispatch<SetStateAction<TableMapRow[]>>;
   peerType?: DBType;
   // schema -> omitted source table mapping
-  omitAdditionalTablesMapping: Map<string, string[]>;
+  alreadySelectedTablesMapping: Map<string, TableMapping[]>;
+  initialLoadOnly: boolean;
 }
 
-const TableMapping = ({
+const TablePicker = ({
   sourcePeerName,
   rows,
   setRows,
   peerType,
-  omitAdditionalTablesMapping,
+  alreadySelectedTablesMapping,
+  initialLoadOnly,
 }: TableMappingProps) => {
   const [allSchemas, setAllSchemas] = useState<string[]>();
   const [schemaQuery, setSchemaQuery] = useState('');
   const [tableColumns, setTableColumns] = useState<
     { tableName: string; columns: string[] }[]
   >([]);
-  const searchedSchemas = useMemo(() => {
-    return allSchemas?.filter((schema) => {
-      return schema.toLowerCase().includes(schemaQuery.toLowerCase());
-    });
-  }, [allSchemas, schemaQuery]);
+  const searchedSchemas = useMemo(
+    () =>
+      allSchemas?.filter((schema) =>
+        schema.toLowerCase().includes(schemaQuery.toLowerCase())
+      ),
+    [allSchemas, schemaQuery]
+  );
 
   useEffect(() => {
     fetchSchemas(sourcePeerName).then((res) => setAllSchemas(res));
-  }, [sourcePeerName]);
+  }, [sourcePeerName, initialLoadOnly]);
 
   return (
     <div style={{ marginTop: '1rem' }}>
       <Label as='label' colorName='lowContrast' style={{ fontSize: 16 }}>
         Select tables to sync
       </Label>
-      <br></br>
+      <br />
       <Label as='label' style={{ fontSize: 15 }}>
         Before selecting tables, please make sure that{' '}
         <Link
@@ -69,10 +74,11 @@ const TableMapping = ({
         >
           Eventhubs targets are of the form{' '}
           <b>namespace.eventhub_name.partition_column.</b>
-          <br></br>
+          <br />
           Namespaces are specified in the Eventhub peer. PeerDB will create the
           eventhub if needed with the name you specify in the provided namespace
-          for each source table <br></br>
+          for each source table
+          <br />
           Messages are sent to partitions based on the values of the partition
           column.
         </Callout>
@@ -108,7 +114,8 @@ const TableMapping = ({
               tableColumns={tableColumns}
               setTableColumns={setTableColumns}
               peerType={peerType}
-              omitAdditionalTables={omitAdditionalTablesMapping.get(schema)}
+              alreadySelectedTables={alreadySelectedTablesMapping.get(schema)}
+              initialLoadOnly={initialLoadOnly}
             />
           ))
         ) : (
@@ -121,4 +128,4 @@ const TableMapping = ({
   );
 };
 
-export default TableMapping;
+export default TablePicker;

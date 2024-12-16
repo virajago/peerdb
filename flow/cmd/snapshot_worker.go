@@ -12,7 +12,6 @@ import (
 
 	"github.com/PeerDB-io/peer-flow/activities"
 	"github.com/PeerDB-io/peer-flow/alerting"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
 	"github.com/PeerDB-io/peer-flow/shared"
 	peerflow "github.com/PeerDB-io/peer-flow/workflows"
@@ -21,19 +20,18 @@ import (
 type SnapshotWorkerOptions struct {
 	TemporalHostPort  string
 	TemporalNamespace string
-	TemporalCert      string
-	TemporalKey       string
 }
 
 func SnapshotWorkerMain(opts *SnapshotWorkerOptions) (client.Client, worker.Worker, error) {
 	clientOptions := client.Options{
 		HostPort:  opts.TemporalHostPort,
 		Namespace: opts.TemporalNamespace,
-		Logger:    slog.New(logger.NewHandler(slog.NewJSONHandler(os.Stdout, nil))),
+		Logger:    slog.New(shared.NewSlogHandler(slog.NewJSONHandler(os.Stdout, nil))),
 	}
 
-	if opts.TemporalCert != "" && opts.TemporalKey != "" {
-		certs, err := base64DecodeCertAndKey(opts.TemporalCert, opts.TemporalKey)
+	if peerdbenv.PeerDBTemporalEnableCertAuth() {
+		slog.Info("Using temporal certificate/key for authentication")
+		certs, err := parseTemporalCertAndKey(context.Background())
 		if err != nil {
 			return nil, nil, fmt.Errorf("unable to process certificate and key: %w", err)
 		}

@@ -10,9 +10,10 @@ import (
 	"github.com/PeerDB-io/peer-flow/model/qvalue"
 )
 
-func qValueKindToBigQueryType(columnDescription *protos.FieldDescription) bigquery.FieldSchema {
+func qValueKindToBigQueryType(columnDescription *protos.FieldDescription, nullableEnabled bool) bigquery.FieldSchema {
 	bqField := bigquery.FieldSchema{
-		Name: columnDescription.Name,
+		Name:     columnDescription.Name,
+		Required: nullableEnabled && !columnDescription.Nullable,
 	}
 	switch qvalue.QValueKind(columnDescription.Type) {
 	// boolean
@@ -32,8 +33,8 @@ func qValueKindToBigQueryType(columnDescription *protos.FieldDescription) bigque
 	// string related
 	case qvalue.QValueKindString:
 		bqField.Type = bigquery.StringFieldType
-	// json also is stored as string for now
-	case qvalue.QValueKindJSON, qvalue.QValueKindHStore:
+	// json related
+	case qvalue.QValueKindJSON, qvalue.QValueKindJSONB, qvalue.QValueKindHStore:
 		bqField.Type = bigquery.JSONFieldType
 	// time related
 	case qvalue.QValueKindTimestamp, qvalue.QValueKindTimestampTZ:
@@ -68,6 +69,12 @@ func qValueKindToBigQueryType(columnDescription *protos.FieldDescription) bigque
 		bqField.Repeated = true
 	case qvalue.QValueKindGeography, qvalue.QValueKindGeometry, qvalue.QValueKindPoint:
 		bqField.Type = bigquery.GeographyFieldType
+	// UUID related - stored as strings for now
+	case qvalue.QValueKindUUID:
+		bqField.Type = bigquery.StringFieldType
+	case qvalue.QValueKindArrayUUID:
+		bqField.Type = bigquery.StringFieldType
+		bqField.Repeated = true
 	// rest will be strings
 	default:
 		bqField.Type = bigquery.StringFieldType
@@ -136,8 +143,8 @@ func createTableCompatibleTypeName(schemaType bigquery.FieldType) string {
 	return string(schemaType)
 }
 
-func qValueKindToBigQueryTypeString(columnDescription *protos.FieldDescription, forMerge bool) string {
-	bqTypeSchema := qValueKindToBigQueryType(columnDescription)
+func qValueKindToBigQueryTypeString(columnDescription *protos.FieldDescription, nullEnabled bool, forMerge bool) string {
+	bqTypeSchema := qValueKindToBigQueryType(columnDescription, nullEnabled)
 	bqType := createTableCompatibleTypeName(bqTypeSchema.Type)
 	if bqTypeSchema.Type == bigquery.BigNumericFieldType && !forMerge {
 		bqType = fmt.Sprintf("BIGNUMERIC(%d,%d)", bqTypeSchema.Precision, bqTypeSchema.Scale)

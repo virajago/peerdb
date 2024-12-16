@@ -4,16 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/PeerDB-io/peer-flow/connectors/utils"
+	"github.com/PeerDB-io/peer-flow/shared"
 )
 
 func (c *PostgresConnector) CheckSourceTables(ctx context.Context,
-	tableNames []*utils.SchemaTable, pubName string,
+	tableNames []*utils.SchemaTable, pubName string, noCDC bool,
 ) error {
 	if c.conn == nil {
 		return errors.New("check tables: conn is nil")
@@ -23,41 +23,57 @@ func (c *PostgresConnector) CheckSourceTables(ctx context.Context,
 	tableArr := make([]string, 0, len(tableNames))
 	for _, parsedTable := range tableNames {
 		var row pgx.Row
-		tableArr = append(tableArr, fmt.Sprintf(`(%s::text, %s::text)`,
+		tableArr = append(tableArr, fmt.Sprintf(`(%s::text,%s::text)`,
 			QuoteLiteral(parsedTable.Schema), QuoteLiteral(parsedTable.Table)))
-		err := c.conn.QueryRow(ctx,
-			fmt.Sprintf("SELECT * FROM %s.%s LIMIT 0;",
-				QuoteIdentifier(parsedTable.Schema), QuoteIdentifier(parsedTable.Table))).Scan(&row)
-		if err != nil && err != pgx.ErrNoRows {
+		if err := c.conn.QueryRow(ctx,
+			fmt.Sprintf("SELECT * FROM %s.%s LIMIT 0", QuoteIdentifier(parsedTable.Schema), QuoteIdentifier(parsedTable.Table)),
+		).Scan(&row); err != nil && err != pgx.ErrNoRows {
 			return err
 		}
 	}
 
-	tableStr := strings.Join(tableArr, ",")
-
-	if pubName != "" {
+	if pubName != "" && !noCDC {
 		// Check if publication exists
-		err := c.conn.QueryRow(ctx, "SELECT pubname FROM pg_publication WHERE pubname=$1", pubName).Scan(nil)
-		if err != nil {
+		var alltables bool
+		if err := c.conn.QueryRow(ctx, "SELECT puballtables FROM pg_publication WHERE pubname=$1", pubName).Scan(&alltables); err != nil {
 			if err == pgx.ErrNoRows {
 				return fmt.Errorf("publication does not exist: %s", pubName)
 			}
 			return fmt.Errorf("error while checking for publication existence: %w", err)
 		}
 
-		// Check if tables belong to publication
-		var pubTableCount int
-		err = c.conn.QueryRow(ctx, fmt.Sprintf(`
-		with source_table_components (sname, tname) as (values %s)
-		select COUNT(DISTINCT(schemaname,tablename)) from pg_publication_tables
-		INNER JOIN source_table_components stc
-		ON schemaname=stc.sname and tablename=stc.tname where pubname=$1;`, tableStr), pubName).Scan(&pubTableCount)
-		if err != nil {
-			return err
-		}
+		if !alltables {
+			// Check if tables belong to publication
+			tableStr := strings.Join(tableArr, ",")
 
-		if pubTableCount != len(tableNames) {
-			return errors.New("not all tables belong to publication")
+			rows, err := c.conn.Query(
+				ctx,
+				fmt.Sprintf(`select schemaname,tablename
+				from (values %s) as input(schemaname,tablename)
+				where not exists (
+					select * from pg_publication_tables pub
+					where pubname=$1 and pub.schemaname=input.schemaname and pub.tablename=input.tablename
+				)`, tableStr),
+				pubName,
+			)
+			if err != nil {
+				return err
+			}
+			missing, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (string, error) {
+				var schema string
+				var table string
+				if err := row.Scan(&schema, &table); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("%s.%s", QuoteIdentifier(schema), QuoteIdentifier(table)), nil
+			})
+			if err != nil {
+				return err
+			}
+
+			if len(missing) != 0 {
+				return errors.New("some tables missing from publication: " + strings.Join(missing, ", "))
+			}
 		}
 	}
 
@@ -72,7 +88,7 @@ func (c *PostgresConnector) CheckReplicationPermissions(ctx context.Context, use
 	var replicationRes bool
 	err := c.conn.QueryRow(ctx, "SELECT rolreplication FROM pg_roles WHERE rolname = $1", username).Scan(&replicationRes)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, pgx.ErrNoRows) {
 			c.logger.Warn("No rows in pg_roles for user. Skipping rolereplication check",
 				"username", username)
 		} else {
@@ -84,7 +100,7 @@ func (c *PostgresConnector) CheckReplicationPermissions(ctx context.Context, use
 		// RDS case: check pg_settings for rds.logical_replication
 		var setting string
 		err := c.conn.QueryRow(ctx, "SELECT setting FROM pg_settings WHERE name = 'rds.logical_replication'").Scan(&setting)
-		if err != pgx.ErrNoRows {
+		if !errors.Is(err, pgx.ErrNoRows) {
 			if err != nil || setting != "on" {
 				return errors.New("postgres user does not have replication role")
 			}
@@ -103,18 +119,14 @@ func (c *PostgresConnector) CheckReplicationPermissions(ctx context.Context, use
 	}
 
 	// max_wal_senders must be at least 2
-	var maxWalSendersRes string
-	err = c.conn.QueryRow(ctx, "SHOW max_wal_senders").Scan(&maxWalSendersRes)
+	var insufficientMaxWalSenders bool
+	err = c.conn.QueryRow(ctx,
+		"SELECT setting::int<2 FROM pg_settings WHERE name='max_wal_senders'").Scan(&insufficientMaxWalSenders)
 	if err != nil {
 		return err
 	}
 
-	maxWalSenders, err := strconv.Atoi(maxWalSendersRes)
-	if err != nil {
-		return err
-	}
-
-	if maxWalSenders < 2 {
+	if insufficientMaxWalSenders {
 		return errors.New("max_wal_senders must be at least 2")
 	}
 
@@ -129,4 +141,16 @@ func (c *PostgresConnector) CheckReplicationConnectivity(ctx context.Context) er
 	}
 
 	return conn.Close(ctx)
+}
+
+func (c *PostgresConnector) CheckPublicationCreationPermissions(ctx context.Context, srcTableNames []string) error {
+	pubName := "_peerdb_tmp_test_publication_" + shared.RandomString(5)
+	if err := c.CreatePublication(ctx, srcTableNames, pubName); err != nil {
+		return err
+	}
+
+	if _, err := c.conn.Exec(ctx, "DROP PUBLICATION "+pubName); err != nil {
+		return fmt.Errorf("failed to drop publication: %v", err)
+	}
+	return nil
 }

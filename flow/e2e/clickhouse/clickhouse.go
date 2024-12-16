@@ -3,17 +3,20 @@ package e2e_clickhouse
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/require"
 
 	"github.com/PeerDB-io/peer-flow/connectors"
-	"github.com/PeerDB-io/peer-flow/connectors/clickhouse"
+	connclickhouse "github.com/PeerDB-io/peer-flow/connectors/clickhouse"
 	connpostgres "github.com/PeerDB-io/peer-flow/connectors/postgres"
 	"github.com/PeerDB-io/peer-flow/e2e"
-	"github.com/PeerDB-io/peer-flow/e2e/s3"
+	e2e_s3 "github.com/PeerDB-io/peer-flow/e2e/s3"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/model/qvalue"
@@ -53,6 +56,11 @@ func (s ClickHouseSuite) Peer() *protos.Peer {
 }
 
 func (s ClickHouseSuite) PeerForDatabase(dbname string) *protos.Peer {
+	region := ""
+	if s.s3Helper.S3Config.Region != nil {
+		region = *s.s3Helper.S3Config.Region
+	}
+
 	ret := &protos.Peer{
 		Name: e2e.AddSuffix(s, dbname),
 		Type: protos.DBType_CLICKHOUSE,
@@ -64,7 +72,7 @@ func (s ClickHouseSuite) PeerForDatabase(dbname string) *protos.Peer {
 				S3Path:          s.s3Helper.BucketName,
 				AccessKeyId:     *s.s3Helper.S3Config.AccessKeyId,
 				SecretAccessKey: *s.s3Helper.S3Config.SecretAccessKey,
-				Region:          *s.s3Helper.S3Config.Region,
+				Region:          region,
 				DisableTls:      true,
 				Endpoint:        s.s3Helper.S3Config.Endpoint,
 			},
@@ -84,43 +92,38 @@ func (s ClickHouseSuite) Teardown() {
 }
 
 func (s ClickHouseSuite) GetRows(table string, cols string) (*model.QRecordBatch, error) {
-	ch, err := connclickhouse.Connect(context.Background(), s.Peer().GetClickhouseConfig())
+	ch, err := connclickhouse.Connect(context.Background(), nil, s.Peer().GetClickhouseConfig())
 	if err != nil {
 		return nil, err
 	}
+	defer ch.Close()
 
 	rows, err := ch.Query(
 		context.Background(),
-		fmt.Sprintf(`SELECT %s FROM e2e_test_%s.%s ORDER BY id`, cols, s.suffix, table),
+		fmt.Sprintf(`SELECT %s FROM %s FINAL WHERE _peerdb_is_deleted = 0 ORDER BY 1 SETTINGS use_query_cache = false`, cols, table),
 	)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	batch := &model.QRecordBatch{}
 	types := rows.ColumnTypes()
 	row := make([]interface{}, 0, len(types))
-	for _, ty := range types {
-		nullable := ty.Nullable()
-		var qkind qvalue.QValueKind
-		switch ty.DatabaseTypeName() {
-		case "String":
-			var val string
-			row = append(row, &val)
-			qkind = qvalue.QValueKindString
-		case "Int32":
-			var val int32
-			row = append(row, &val)
-			qkind = qvalue.QValueKindInt32
-		default:
-			return nil, fmt.Errorf("failed to resolve QValueKind for %s", ty.DatabaseTypeName())
-		}
+	tableSchema, err := connclickhouse.GetTableSchemaForTable(table, types)
+	if err != nil {
+		return nil, err
+	}
+
+	for idx, ty := range types {
+		fieldDesc := tableSchema.Columns[idx]
+		row = append(row, reflect.New(ty.ScanType()).Interface())
 		batch.Schema.Fields = append(batch.Schema.Fields, qvalue.QField{
 			Name:      ty.Name(),
-			Type:      qkind,
+			Type:      qvalue.QValueKind(fieldDesc.Type),
 			Precision: 0,
 			Scale:     0,
-			Nullable:  nullable,
+			Nullable:  fieldDesc.Nullable,
 		})
 	}
 
@@ -131,10 +134,78 @@ func (s ClickHouseSuite) GetRows(table string, cols string) (*model.QRecordBatch
 		qrow := make([]qvalue.QValue, 0, len(row))
 		for _, val := range row {
 			switch v := val.(type) {
+			case **string:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindString))
+				} else {
+					qrow = append(qrow, qvalue.QValueString{Val: **v})
+				}
 			case *string:
 				qrow = append(qrow, qvalue.QValueString{Val: *v})
+			case **int32:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindInt32))
+				} else {
+					qrow = append(qrow, qvalue.QValueInt32{Val: **v})
+				}
 			case *int32:
 				qrow = append(qrow, qvalue.QValueInt32{Val: *v})
+			case **time.Time:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindTimestamp))
+				} else {
+					qrow = append(qrow, qvalue.QValueTimestamp{Val: **v})
+				}
+			case *time.Time:
+				qrow = append(qrow, qvalue.QValueTimestamp{Val: *v})
+			case **decimal.Decimal:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindNumeric))
+				} else {
+					qrow = append(qrow, qvalue.QValueNumeric{Val: **v})
+				}
+			case *decimal.Decimal:
+				qrow = append(qrow, qvalue.QValueNumeric{Val: *v})
+			case **bool:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindBoolean))
+				} else {
+					qrow = append(qrow, qvalue.QValueBoolean{Val: **v})
+				}
+			case *bool:
+				qrow = append(qrow, qvalue.QValueBoolean{Val: *v})
+			case **float32:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindFloat32))
+				} else {
+					qrow = append(qrow, qvalue.QValueFloat32{Val: **v})
+				}
+			case *float32:
+				qrow = append(qrow, qvalue.QValueFloat32{Val: *v})
+			case **float64:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindFloat64))
+				} else {
+					qrow = append(qrow, qvalue.QValueFloat64{Val: **v})
+				}
+			case *float64:
+				qrow = append(qrow, qvalue.QValueFloat64{Val: *v})
+			case **int64:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindInt64))
+				} else {
+					qrow = append(qrow, qvalue.QValueInt64{Val: **v})
+				}
+			case *int64:
+				qrow = append(qrow, qvalue.QValueInt64{Val: *v})
+			case **int16:
+				if *v == nil {
+					qrow = append(qrow, qvalue.QValueNull(qvalue.QValueKindInt16))
+				} else {
+					qrow = append(qrow, qvalue.QValueInt16{Val: **v})
+				}
+			case *int16:
+				qrow = append(qrow, qvalue.QValueInt16{Val: *v})
 			default:
 				return nil, fmt.Errorf("cannot convert %T to qvalue", v)
 			}
@@ -152,7 +223,7 @@ func SetupSuite(t *testing.T) ClickHouseSuite {
 	conn, err := e2e.SetupPostgres(t, suffix)
 	require.NoError(t, err, "failed to setup postgres")
 
-	s3Helper, err := e2e_s3.NewS3TestHelper(false)
+	s3Helper, err := e2e_s3.NewS3TestHelper(e2e_s3.Minio)
 	require.NoError(t, err, "failed to setup S3")
 
 	s := ClickHouseSuite{
@@ -162,7 +233,7 @@ func SetupSuite(t *testing.T) ClickHouseSuite {
 		s3Helper: s3Helper,
 	}
 
-	ch, err := connclickhouse.Connect(context.Background(), s.PeerForDatabase("default").GetClickhouseConfig())
+	ch, err := connclickhouse.Connect(context.Background(), nil, s.PeerForDatabase("default").GetClickhouseConfig())
 	require.NoError(t, err, "failed to connect to clickhouse")
 	err = ch.Exec(context.Background(), "CREATE DATABASE e2e_test_"+suffix)
 	require.NoError(t, err, "failed to create clickhouse database")

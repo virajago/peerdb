@@ -2,10 +2,10 @@ package shared
 
 import (
 	"log/slog"
+	"maps"
 	"slices"
 
 	"go.temporal.io/sdk/log"
-	"golang.org/x/exp/maps"
 
 	"github.com/PeerDB-io/peer-flow/generated/protos"
 )
@@ -34,13 +34,13 @@ func AdditionalTablesHasOverlap(currentTableMappings []*protos.TableMapping,
 // given the output of GetTableSchema, processes it to be used by CDCFlow
 // 1) changes the map key to be the destination table name instead of the source table name
 // 2) performs column exclusion using protos.TableMapping as input.
-func BuildProcessedSchemaMapping(tableMappings []*protos.TableMapping,
+func BuildProcessedSchemaMapping(
+	tableMappings []*protos.TableMapping,
 	tableNameSchemaMapping map[string]*protos.TableSchema,
 	logger log.Logger,
 ) map[string]*protos.TableSchema {
-	processedSchemaMapping := make(map[string]*protos.TableSchema)
-	sortedSourceTables := maps.Keys(tableNameSchemaMapping)
-	slices.Sort(sortedSourceTables)
+	sortedSourceTables := slices.Sorted(maps.Keys(tableNameSchemaMapping))
+	processedSchemaMapping := make(map[string]*protos.TableSchema, len(sortedSourceTables))
 
 	for _, srcTableName := range sortedSourceTables {
 		tableSchema := tableNameSchemaMapping[srcTableName]
@@ -49,17 +49,22 @@ func BuildProcessedSchemaMapping(tableMappings []*protos.TableMapping,
 			if mapping.SourceTableIdentifier == srcTableName {
 				dstTableName = mapping.DestinationTableIdentifier
 				if len(mapping.Exclude) != 0 {
-					columnCount := len(tableSchema.Columns)
-					columns := make([]*protos.FieldDescription, 0, columnCount)
+					columns := make([]*protos.FieldDescription, 0, len(tableSchema.Columns))
+					pkeyColumns := make([]string, 0, len(tableSchema.PrimaryKeyColumns))
 					for _, column := range tableSchema.Columns {
 						if !slices.Contains(mapping.Exclude, column.Name) {
 							columns = append(columns, column)
 						}
+						if slices.Contains(tableSchema.PrimaryKeyColumns, column.Name) &&
+							!slices.Contains(mapping.Exclude, column.Name) {
+							pkeyColumns = append(pkeyColumns, column.Name)
+						}
 					}
 					tableSchema = &protos.TableSchema{
 						TableIdentifier:       tableSchema.TableIdentifier,
-						PrimaryKeyColumns:     tableSchema.PrimaryKeyColumns,
+						PrimaryKeyColumns:     pkeyColumns,
 						IsReplicaIdentityFull: tableSchema.IsReplicaIdentityFull,
+						NullableEnabled:       tableSchema.NullableEnabled,
 						System:                tableSchema.System,
 						Columns:               columns,
 					}

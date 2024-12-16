@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
 	"github.com/PeerDB-io/peer-flow/connectors/utils"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/shared"
+	"github.com/PeerDB-io/peer-flow/peerdbenv"
 )
 
 type SnowflakeAvroConsolidateHandler struct {
@@ -136,8 +137,12 @@ func (s *SnowflakeAvroConsolidateHandler) getCopyTransformation(copyDstTable str
 		s.config.SyncedAtColName,
 		s.config.SoftDeleteColName,
 	)
-	return fmt.Sprintf("COPY INTO %s(%s) FROM (SELECT %s FROM @%s) FILE_FORMAT=(TYPE=AVRO), PURGE=TRUE",
-		copyDstTable, columnsSQL, transformationSQL, s.stage)
+	onErrorStr := ""
+	if onError := peerdbenv.GetEnvString("PEERDB_SNOWFLAKE_ON_ERROR", ""); onError != "" {
+		onErrorStr = ", ON_ERROR=" + onError
+	}
+	return fmt.Sprintf("COPY INTO %s(%s) FROM (SELECT %s FROM @%s) FILE_FORMAT=(TYPE=AVRO), PURGE=TRUE%s",
+		copyDstTable, columnsSQL, transformationSQL, s.stage, onErrorStr)
 }
 
 func (s *SnowflakeAvroConsolidateHandler) handleAppendMode(ctx context.Context) error {
@@ -209,10 +214,8 @@ func (s *SnowflakeAvroConsolidateHandler) generateUpsertMergeCommand(
 
 // handleUpsertMode handles the upsert mode
 func (s *SnowflakeAvroConsolidateHandler) handleUpsertMode(ctx context.Context) error {
-	runID, err := shared.RandomUInt64()
-	if err != nil {
-		return fmt.Errorf("failed to generate run ID: %w", err)
-	}
+	//nolint:gosec // number has no cryptographic significance
+	runID := rand.Uint64()
 
 	tempTableName := fmt.Sprintf("%s_temp_%d", s.dstTableName, runID)
 
@@ -225,8 +228,8 @@ func (s *SnowflakeAvroConsolidateHandler) handleUpsertMode(ctx context.Context) 
 	s.connector.logger.Info("created temp table " + tempTableName)
 
 	copyCmd := s.getCopyTransformation(tempTableName)
-	_, err = s.connector.database.ExecContext(ctx, copyCmd)
-	if err != nil {
+
+	if _, err := s.connector.database.ExecContext(ctx, copyCmd); err != nil {
 		return fmt.Errorf("failed to run COPY INTO command: %w", err)
 	}
 	s.connector.logger.Info("copied file from stage " + s.stage + " to temp table " + tempTableName)

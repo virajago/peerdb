@@ -3,9 +3,9 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -44,7 +44,7 @@ func (h *FlowRequestHandler) getPGPeerConfig(ctx context.Context, peerName strin
 		return nil, err
 	}
 
-	peerOptions, err := peerdbenv.Decrypt(encKeyID, encPeerOptions)
+	peerOptions, err := peerdbenv.Decrypt(ctx, encKeyID, encPeerOptions)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load peer: %w", err)
 	}
@@ -81,10 +81,24 @@ func (h *FlowRequestHandler) getConnForPGPeer(ctx context.Context, peerName stri
 func (h *FlowRequestHandler) GetPeerInfo(
 	ctx context.Context,
 	req *protos.PeerInfoRequest,
-) (*protos.Peer, error) {
+) (*protos.PeerInfoResponse, error) {
 	peer, err := connectors.LoadPeer(ctx, h.pool, req.PeerName)
 	if err != nil {
 		return nil, err
+	}
+
+	var version string
+	versionConnector, err := connectors.GetAs[connectors.GetVersionConnector](ctx, nil, peer)
+	if err != nil {
+		if !errors.Is(err, errors.ErrUnsupported) {
+			slog.Error("failed to get version connector", slog.Any("error", err))
+		}
+	} else {
+		defer connectors.CloseConnector(ctx, versionConnector)
+		version, err = versionConnector.GetVersion(ctx)
+		if err != nil {
+			slog.Error("failed to get version", slog.Any("error", err))
+		}
 	}
 
 	peer.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
@@ -93,7 +107,11 @@ func (h *FlowRequestHandler) GetPeerInfo(
 		}
 		return true
 	})
-	return peer, nil
+
+	return &protos.PeerInfoResponse{
+		Peer:    peer,
+		Version: version,
+	}, nil
 }
 
 func (h *FlowRequestHandler) ListPeers(
@@ -101,7 +119,7 @@ func (h *FlowRequestHandler) ListPeers(
 	req *protos.ListPeersRequest,
 ) (*protos.ListPeersResponse, error) {
 	query := "SELECT name, type FROM peers"
-	if peerdbenv.PeerDBAllowedTargets() == strings.ToLower(protos.DBType_CLICKHOUSE.String()) {
+	if peerdbenv.PeerDBOnlyClickHouseAllowed() {
 		// only postgres and clickhouse peers
 		query += " WHERE type IN (3, 8)"
 	}
@@ -129,7 +147,7 @@ func (h *FlowRequestHandler) ListPeers(
 	}
 
 	destinationItems := peers
-	if peerdbenv.PeerDBAllowedTargets() == strings.ToLower(protos.DBType_CLICKHOUSE.String()) {
+	if peerdbenv.PeerDBOnlyClickHouseAllowed() {
 		destinationItems = make([]*protos.PeerListItem, 0, len(peers))
 		for _, peer := range peers {
 			// only clickhouse peers
@@ -205,7 +223,7 @@ func (h *FlowRequestHandler) GetTablesInSchema(
 		`AND t.relispartition IS NOT TRUE ORDER BY t.relname, can_mirror DESC;
 `, req.SchemaName)
 	if err != nil {
-		slog.Info("failed to fetch publications", slog.Any("error", err))
+		slog.Info("failed to fetch tables", slog.Any("error", err))
 		return nil, err
 	}
 
@@ -221,7 +239,7 @@ func (h *FlowRequestHandler) GetTablesInSchema(
 			sizeOfTable = tableSize.String
 		}
 		canMirror := false
-		if hasPkeyOrReplica.Valid && hasPkeyOrReplica.Bool {
+		if !req.CdcEnabled || (hasPkeyOrReplica.Valid && hasPkeyOrReplica.Bool) {
 			canMirror = true
 		}
 
@@ -278,19 +296,20 @@ func (h *FlowRequestHandler) GetColumns(
 	defer peerConn.Close(ctx)
 
 	rows, err := peerConn.Query(ctx, `SELECT
-		distinct attname AS column_name,
-		format_type(atttypid, atttypmod) AS data_type,
-		(attnum = ANY(conkey)) AS is_primary_key
+    DISTINCT attname AS column_name,
+    format_type(atttypid, atttypmod) AS data_type,
+    (pg_constraint.contype = 'p') AS is_primary_key
 	FROM pg_attribute
 	JOIN pg_class ON pg_attribute.attrelid = pg_class.oid
-	JOIN pg_namespace on pg_class.relnamespace = pg_namespace.oid
+	JOIN pg_namespace ON pg_class.relnamespace = pg_namespace.oid
 	LEFT JOIN pg_constraint ON pg_attribute.attrelid = pg_constraint.conrelid
 		AND pg_attribute.attnum = ANY(pg_constraint.conkey)
+		AND pg_constraint.contype = 'p'
 	WHERE pg_namespace.nspname = $1
 		AND relname = $2
 		AND pg_attribute.attnum > 0
 		AND NOT attisdropped
-	ORDER BY column_name`, req.SchemaName, req.TableName)
+	ORDER BY column_name;`, req.SchemaName, req.TableName)
 	if err != nil {
 		return nil, err
 	}
@@ -320,7 +339,7 @@ func (h *FlowRequestHandler) GetSlotInfo(
 		return nil, err
 	}
 
-	pgConnector, err := connpostgres.NewPostgresConnector(ctx, pgConfig)
+	pgConnector, err := connpostgres.NewPostgresConnector(ctx, nil, pgConfig)
 	if err != nil {
 		slog.Error("Failed to create postgres connector", slog.Any("error", err))
 		return nil, err
@@ -342,7 +361,8 @@ func (h *FlowRequestHandler) GetSlotLagHistory(
 	ctx context.Context,
 	req *protos.GetSlotLagHistoryRequest,
 ) (*protos.GetSlotLagHistoryResponse, error) {
-	rows, err := h.pool.Query(ctx, `select updated_at, slot_size
+	rows, err := h.pool.Query(ctx, `select updated_at, slot_size,
+			coalesce(redo_lsn,''), coalesce(restart_lsn,''), coalesce(confirmed_flush_lsn,'')
 		from peerdb_stats.peer_slot_size
 		where slot_size is not null
 			and peer_name = $1
@@ -355,12 +375,18 @@ func (h *FlowRequestHandler) GetSlotLagHistory(
 	points, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.SlotLagPoint, error) {
 		var updatedAt time.Time
 		var slotSize int64
-		if err := row.Scan(&updatedAt, &slotSize); err != nil {
+		var redoLSN string
+		var restartLSN string
+		var confirmedFlushLSN string
+		if err := row.Scan(&updatedAt, &slotSize, &redoLSN, &restartLSN, &confirmedFlushLSN); err != nil {
 			return nil, err
 		}
 		return &protos.SlotLagPoint{
-			UpdatedAt: float64(updatedAt.UnixMilli()),
-			SlotSize:  float64(slotSize) / 1000.0,
+			Time:         float64(updatedAt.UnixMilli()),
+			Size:         float64(slotSize) / 1000.0,
+			RedoLSN:      redoLSN,
+			RestartLSN:   restartLSN,
+			ConfirmedLSN: confirmedFlushLSN,
 		}, nil
 	})
 	if err != nil {
@@ -384,9 +410,9 @@ func (h *FlowRequestHandler) GetStatInfo(
 	peerUser := peerConn.Config().User
 
 	rows, err := peerConn.Query(ctx, "SELECT pid, wait_event, wait_event_type, query_start::text, query,"+
-		"EXTRACT(epoch FROM(now()-query_start)) AS dur"+
+		"EXTRACT(epoch FROM(now()-query_start)) AS dur, state"+
 		" FROM pg_stat_activity WHERE "+
-		"usename=$1 AND state != 'idle';", peerUser)
+		"usename=$1 AND application_name LIKE 'peerdb%';", peerUser)
 	if err != nil {
 		slog.Error("Failed to get stat info", slog.Any("error", err))
 		return nil, err
@@ -399,8 +425,10 @@ func (h *FlowRequestHandler) GetStatInfo(
 		var queryStart sql.NullString
 		var query sql.NullString
 		var duration sql.NullFloat64
+		// shouldn't be null
+		var state string
 
-		err := rows.Scan(&pid, &waitEvent, &waitEventType, &queryStart, &query, &duration)
+		err := rows.Scan(&pid, &waitEvent, &waitEventType, &queryStart, &query, &duration, &state)
 		if err != nil {
 			slog.Error("Failed to scan row", slog.Any("error", err))
 			return nil, err
@@ -438,6 +466,7 @@ func (h *FlowRequestHandler) GetStatInfo(
 			QueryStart:    qs,
 			Query:         q,
 			Duration:      float32(d),
+			State:         state,
 		}, nil
 	})
 	if err != nil {

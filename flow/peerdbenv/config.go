@@ -1,9 +1,15 @@
 package peerdbenv
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/PeerDB-io/peer-flow/generated/protos"
 	"github.com/PeerDB-io/peer-flow/shared"
 )
 
@@ -36,7 +42,7 @@ func PeerDBCDCIdleTimeoutSeconds(providedValue int) time.Duration {
 	if providedValue > 0 {
 		x = providedValue
 	} else {
-		x = getEnvInt("", 10)
+		x = getEnvConvert("", 10, strconv.Atoi)
 	}
 	return time.Duration(x) * time.Second
 }
@@ -62,8 +68,14 @@ func PeerDBCatalogUser() string {
 }
 
 // PEERDB_CATALOG_PASSWORD
-func PeerDBCatalogPassword() string {
-	return GetEnvString("PEERDB_CATALOG_PASSWORD", "")
+func PeerDBCatalogPassword(ctx context.Context) string {
+	val, err := GetKmsDecryptedEnvString(ctx, "PEERDB_CATALOG_PASSWORD", "")
+	if err != nil {
+		slog.Error("failed to decrypt PEERDB_CATALOG_PASSWORD", "error", err)
+		panic(err)
+	}
+
+	return val
 }
 
 // PEERDB_CATALOG_DATABASE
@@ -97,13 +109,24 @@ func PeerDBCurrentEncKeyID() string {
 	return GetEnvString("PEERDB_CURRENT_ENC_KEY_ID", "")
 }
 
-func PeerDBEncKeys() shared.PeerDBEncKeys {
-	return GetEnvJSON[shared.PeerDBEncKeys]("PEERDB_ENC_KEYS", nil)
+func PeerDBEncKeys(ctx context.Context) shared.PeerDBEncKeys {
+	val, err := GetKmsDecryptedEnvString(ctx, "PEERDB_ENC_KEYS", "")
+	if err != nil {
+		slog.Error("failed to decrypt PEERDB_ENC_KEYS", "error", err)
+		panic(err)
+	}
+
+	var result shared.PeerDBEncKeys
+	if err := json.Unmarshal([]byte(val), &result); err != nil {
+		return nil
+	}
+
+	return result
 }
 
-func PeerDBCurrentEncKey() (shared.PeerDBEncKey, error) {
+func PeerDBCurrentEncKey(ctx context.Context) (shared.PeerDBEncKey, error) {
 	encKeyID := PeerDBCurrentEncKeyID()
-	encKeys := PeerDBEncKeys()
+	encKeys := PeerDBEncKeys(ctx)
 	return encKeys.Get(encKeyID)
 }
 
@@ -111,6 +134,46 @@ func PeerDBAllowedTargets() string {
 	return GetEnvString("PEERDB_ALLOWED_TARGETS", "")
 }
 
-func PeerDBClickhouseAllowedDomains() string {
+func PeerDBOnlyClickHouseAllowed() bool {
+	return strings.EqualFold(PeerDBAllowedTargets(), protos.DBType_CLICKHOUSE.String())
+}
+
+func PeerDBClickHouseAllowedDomains() string {
 	return GetEnvString("PEERDB_CLICKHOUSE_ALLOWED_DOMAINS", "")
+}
+
+func PeerDBTemporalEnableCertAuth() bool {
+	cert := GetEnvString("TEMPORAL_CLIENT_CERT", "")
+	return strings.TrimSpace(cert) != ""
+}
+
+func PeerDBTemporalClientCert(ctx context.Context) ([]byte, error) {
+	return GetKmsDecryptedEnvBase64EncodedBytes(ctx, "TEMPORAL_CLIENT_CERT", nil)
+}
+
+func PeerDBTemporalClientKey(ctx context.Context) ([]byte, error) {
+	return GetKmsDecryptedEnvBase64EncodedBytes(ctx, "TEMPORAL_CLIENT_KEY", nil)
+}
+
+func PeerDBGetIncidentIoUrl() string {
+	return GetEnvString("PEERDB_INCIDENTIO_URL", "")
+}
+
+func PeerDBGetIncidentIoToken() string {
+	return GetEnvString("PEERDB_INCIDENTIO_TOKEN", "")
+}
+
+func PeerDBRAPIRequestLoggingEnabled() bool {
+	requestLoggingEnabled, err := strconv.ParseBool(GetEnvString("PEERDB_API_REQUEST_LOGGING_ENABLED", "false"))
+	if err != nil {
+		slog.Error("failed to parse PEERDB_API_REQUEST_LOGGING_ENABLED to bool", "error", err)
+		return false
+	}
+	return requestLoggingEnabled
+}
+
+// PEERDB_MAINTENANCE_MODE_WAIT_ALERT_SECONDS tells how long to wait before alerting that peerdb has been stuck in maintenance mode
+// for too long
+func PeerDBMaintenanceModeWaitAlertSeconds() int {
+	return getEnvConvert("PEERDB_MAINTENANCE_MODE_WAIT_ALERT_SECONDS", 600, strconv.Atoi)
 }

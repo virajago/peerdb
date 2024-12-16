@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/google/uuid"
-
 	"github.com/PeerDB-io/peer-flow/datatypes"
 	"github.com/PeerDB-io/peer-flow/model/qvalue"
 )
@@ -16,6 +14,7 @@ type Items interface {
 	UpdateIfNotExists(Items) []string
 	GetBytesByColName(string) ([]byte, error)
 	ToJSONWithOptions(ToJSONOptions) (string, error)
+	DeleteColName(string)
 }
 
 func ItemsToJSON(items Items) (string, error) {
@@ -88,7 +87,7 @@ func (r RecordItems) toMap(opts ToJSONOptions) (map[string]interface{}, error) {
 
 		switch v := qv.(type) {
 		case qvalue.QValueUUID:
-			jsonStruct[col] = uuid.UUID(v.Val)
+			jsonStruct[col] = v.Val
 		case qvalue.QValueQChar:
 			jsonStruct[col] = string(v.Val)
 		case qvalue.QValueString:
@@ -211,4 +210,8 @@ func (r RecordItems) MarshalJSONWithOptions(opts ToJSONOptions) ([]byte, error) 
 	}
 
 	return json.Marshal(jsonStruct)
+}
+
+func (r RecordItems) DeleteColName(colName string) {
+	delete(r.ColToVal, colName)
 }

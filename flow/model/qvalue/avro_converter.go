@@ -1,6 +1,8 @@
 package qvalue
 
 import (
+	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,9 +15,22 @@ import (
 
 	"github.com/PeerDB-io/peer-flow/datatypes"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
+	"github.com/PeerDB-io/peer-flow/peerdbenv"
 )
 
+type AvroSchemaField struct {
+	Name        string      `json:"name"`
+	Type        interface{} `json:"type"`
+	LogicalType string      `json:"logicalType,omitempty"`
+}
+
+type AvroSchemaLogical struct {
+	Type        string `json:"type"`
+	LogicalType string `json:"logicalType,omitempty"`
+}
+
 // https://avro.apache.org/docs/1.11.0/spec.html
+// please make this generic at some point
 type AvroSchemaArray struct {
 	Type  string `json:"type"`
 	Items string `json:"items"`
@@ -37,17 +52,6 @@ type AvroSchemaRecord struct {
 	Type   string            `json:"type"`
 	Name   string            `json:"name"`
 	Fields []AvroSchemaField `json:"fields"`
-}
-
-type AvroSchemaLogical struct {
-	Type        string `json:"type"`
-	LogicalType string `json:"logicalType,omitempty"`
-}
-
-type AvroSchemaField struct {
-	Name        string      `json:"name"`
-	Type        interface{} `json:"type"`
-	LogicalType string      `json:"logicalType,omitempty"`
 }
 
 func TruncateOrLogNumeric(num decimal.Decimal, precision int16, scale int16, targetDB protos.DBType) (decimal.Decimal, error) {
@@ -72,7 +76,14 @@ func TruncateOrLogNumeric(num decimal.Decimal, precision int16, scale int16, tar
 //
 // For example, QValueKindInt64 would return an AvroLogicalSchema of "long". Unsupported QValueKinds
 // will return an error.
-func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, precision int16, scale int16) (interface{}, error) {
+func GetAvroSchemaFromQValueKind(
+	ctx context.Context,
+	env map[string]string,
+	kind QValueKind,
+	targetDWH protos.DBType,
+	precision int16,
+	scale int16,
+) (interface{}, error) {
 	switch kind {
 	case QValueKindString:
 		return "string", nil
@@ -85,6 +96,14 @@ func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, preci
 			Type:        "string",
 			LogicalType: "uuid",
 		}, nil
+	case QValueKindArrayUUID:
+		return AvroSchemaComplexArray{
+			Type: "array",
+			Items: AvroSchemaField{
+				Type:        "string",
+				LogicalType: "uuid",
+			},
+		}, nil
 	case QValueKindGeometry, QValueKindGeography, QValueKindPoint:
 		return "string", nil
 	case QValueKindInt16, QValueKindInt32, QValueKindInt64:
@@ -96,8 +115,25 @@ func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, preci
 	case QValueKindBoolean:
 		return "boolean", nil
 	case QValueKindBytes:
+		if targetDWH == protos.DBType_CLICKHOUSE {
+			return "string", nil
+		}
 		return "bytes", nil
 	case QValueKindNumeric:
+		if targetDWH == protos.DBType_CLICKHOUSE {
+			if precision == 0 && scale == 0 {
+				asString, err := peerdbenv.PeerDBEnableClickHouseNumericAsString(ctx, env)
+				if err != nil {
+					return nil, err
+				}
+				if asString {
+					return "string", nil
+				}
+			}
+			if precision > datatypes.PeerDBClickHouseMaxPrecision {
+				return "string", nil
+			}
+		}
 		avroNumericPrecision, avroNumericScale := DetermineNumericSettingForDWH(precision, scale, targetDWH)
 		return AvroSchemaNumeric{
 			Type:        "bytes",
@@ -105,18 +141,20 @@ func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, preci
 			Precision:   avroNumericPrecision,
 			Scale:       avroNumericScale,
 		}, nil
-	case QValueKindTime, QValueKindTimeTZ, QValueKindDate:
+	case QValueKindDate:
 		if targetDWH == protos.DBType_CLICKHOUSE {
-			if kind == QValueKindTime {
-				return "string", nil
-			}
-			if kind == QValueKindDate {
-				return AvroSchemaLogical{
-					Type:        "int",
-					LogicalType: "date",
-				}, nil
-			}
-			return "long", nil
+			return AvroSchemaLogical{
+				Type:        "int",
+				LogicalType: "date",
+			}, nil
+		}
+		return "string", nil
+	case QValueKindTime, QValueKindTimeTZ:
+		if targetDWH == protos.DBType_CLICKHOUSE {
+			return AvroSchemaLogical{
+				Type:        "long",
+				LogicalType: "time-micros",
+			}, nil
 		}
 		return "string", nil
 	case QValueKindTimestamp, QValueKindTimestampTZ:
@@ -127,7 +165,9 @@ func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, preci
 			}, nil
 		}
 		return "string", nil
-	case QValueKindHStore, QValueKindJSON, QValueKindStruct:
+	case QValueKindTSTZRange:
+		return "string", nil
+	case QValueKindHStore, QValueKindJSON, QValueKindJSONB, QValueKindStruct:
 		return "string", nil
 	case QValueKindArrayFloat32:
 		return AvroSchemaArray{
@@ -155,15 +195,35 @@ func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, preci
 			Items: "boolean",
 		}, nil
 	case QValueKindArrayDate:
+		if targetDWH == protos.DBType_CLICKHOUSE {
+			return AvroSchemaComplexArray{
+				Type: "array",
+				Items: AvroSchemaField{
+					Type:        "int",
+					LogicalType: "date",
+				},
+			}, nil
+		}
 		return AvroSchemaArray{
 			Type:  "array",
 			Items: "string",
 		}, nil
 	case QValueKindArrayTimestamp, QValueKindArrayTimestampTZ:
+		if targetDWH == protos.DBType_CLICKHOUSE {
+			return AvroSchemaComplexArray{
+				Type: "array",
+				Items: AvroSchemaField{
+					Type:        "long",
+					LogicalType: "timestamp-micros",
+				},
+			}, nil
+		}
 		return AvroSchemaArray{
 			Type:  "array",
 			Items: "string",
 		}, nil
+	case QValueKindArrayJSON, QValueKindArrayJSONB:
+		return "string", nil
 	case QValueKindArrayString:
 		return AvroSchemaArray{
 			Type:  "array",
@@ -179,19 +239,24 @@ func GetAvroSchemaFromQValueKind(kind QValueKind, targetDWH protos.DBType, preci
 
 type QValueAvroConverter struct {
 	*QField
-	logger    log.Logger
-	TargetDWH protos.DBType
+	logger                   log.Logger
+	TargetDWH                protos.DBType
+	UnboundedNumericAsString bool
 }
 
-func QValueToAvro(value QValue, field *QField, targetDWH protos.DBType, logger log.Logger) (interface{}, error) {
+func QValueToAvro(
+	value QValue, field *QField, targetDWH protos.DBType, logger log.Logger,
+	unboundedNumericAsString bool,
+) (any, error) {
 	if value.Value() == nil {
 		return nil, nil
 	}
 
-	c := &QValueAvroConverter{
-		QField:    field,
-		TargetDWH: targetDWH,
-		logger:    logger,
+	c := QValueAvroConverter{
+		QField:                   field,
+		TargetDWH:                targetDWH,
+		logger:                   logger,
+		UnboundedNumericAsString: unboundedNumericAsString,
 	}
 
 	switch v := value.(type) {
@@ -203,26 +268,18 @@ func QValueToAvro(value QValue, field *QField, targetDWH protos.DBType, logger l
 		if t == nil {
 			return nil, nil
 		}
-
 		if c.TargetDWH == protos.DBType_SNOWFLAKE {
 			if c.Nullable {
 				return c.processNullableUnion("string", t.(string))
 			} else {
 				return t.(string), nil
 			}
-		}
-
-		if c.TargetDWH == protos.DBType_CLICKHOUSE {
+		} else {
 			if c.Nullable {
-				return c.processNullableUnion("string", t.(string))
-			} else {
-				return t.(string), nil
+				return goavro.Union("long.time-micros", t.(int64)), nil
 			}
+			return t.(int64), nil
 		}
-		if c.Nullable {
-			return goavro.Union("long.time-micros", t.(int64)), nil
-		}
-		return t.(int64), nil
 	case QValueTimeTZ:
 		t := c.processGoTimeTZ(v.Val)
 		if t == nil {
@@ -234,19 +291,12 @@ func QValueToAvro(value QValue, field *QField, targetDWH protos.DBType, logger l
 			} else {
 				return t.(string), nil
 			}
-		}
-
-		if c.TargetDWH == protos.DBType_CLICKHOUSE {
+		} else {
 			if c.Nullable {
-				return c.processNullableUnion("long", t.(int64))
-			} else {
-				return t.(int64), nil
+				return goavro.Union("long.time-micros", t.(int64)), nil
 			}
+			return t.(int64), nil
 		}
-		if c.Nullable {
-			return goavro.Union("long.time-micros", t.(int64)), nil
-		}
-		return t.(int64), nil
 	case QValueTimestamp:
 		t := c.processGoTimestamp(v.Val)
 		if t == nil {
@@ -301,7 +351,7 @@ func QValueToAvro(value QValue, field *QField, targetDWH protos.DBType, logger l
 		return t, nil
 	case QValueQChar:
 		return c.processNullableUnion("string", string(v.Val))
-	case QValueString, QValueCIDR, QValueINET, QValueMacaddr, QValueInterval:
+	case QValueString, QValueCIDR, QValueINET, QValueMacaddr, QValueInterval, QValueTSTZRange:
 		if c.TargetDWH == protos.DBType_SNOWFLAKE && v.Value() != nil &&
 			(len(v.Value().(string)) > 15*1024*1024) {
 			slog.Warn("Clearing TEXT value > 15MB for Snowflake!")
@@ -352,6 +402,8 @@ func QValueToAvro(value QValue, field *QField, targetDWH protos.DBType, logger l
 		return c.processArrayDate(v.Val), nil
 	case QValueUUID:
 		return c.processUUID(v.Val), nil
+	case QValueArrayUUID:
+		return c.processArrayUUID(v.Val), nil
 	case QValueGeography, QValueGeometry, QValuePoint:
 		return c.processGeospatial(v.Value().(string)), nil
 	default:
@@ -372,9 +424,6 @@ func (c *QValueAvroConverter) processGoTime(t time.Time) interface{} {
 	// Snowflake has issues with avro timestamp types, returning as string form
 	// See: https://stackoverflow.com/questions/66104762/snowflake-date-column-have-incorrect-date-from-avro-file
 	if c.TargetDWH == protos.DBType_SNOWFLAKE {
-		return t.Format("15:04:05.999999")
-	}
-	if c.TargetDWH == protos.DBType_CLICKHOUSE {
 		return t.Format("15:04:05.999999")
 	}
 
@@ -441,7 +490,13 @@ func (c *QValueAvroConverter) processNullableUnion(
 	return value, nil
 }
 
-func (c *QValueAvroConverter) processNumeric(num decimal.Decimal) interface{} {
+func (c *QValueAvroConverter) processNumeric(num decimal.Decimal) any {
+	if (c.UnboundedNumericAsString && c.Precision == 0 && c.Scale == 0) ||
+		(c.TargetDWH == protos.DBType_CLICKHOUSE && c.Precision > datatypes.PeerDBClickHouseMaxPrecision) {
+		numStr, _ := c.processNullableUnion("string", num.String())
+		return numStr
+	}
+
 	num, err := TruncateOrLogNumeric(num, c.Precision, c.Scale, c.TargetDWH)
 	if err != nil {
 		return nil
@@ -455,6 +510,13 @@ func (c *QValueAvroConverter) processNumeric(num decimal.Decimal) interface{} {
 }
 
 func (c *QValueAvroConverter) processBytes(byteData []byte) interface{} {
+	if c.TargetDWH == protos.DBType_CLICKHOUSE {
+		encoded := base64.StdEncoding.EncodeToString(byteData)
+		if c.Nullable {
+			return goavro.Union("string", encoded)
+		}
+		return encoded
+	}
 	if c.Nullable {
 		return goavro.Union("bytes", byteData)
 	}
@@ -546,12 +608,25 @@ func (c *QValueAvroConverter) processHStore(hstore string) (interface{}, error) 
 	return jsonString, nil
 }
 
-func (c *QValueAvroConverter) processUUID(byteData [16]byte) interface{} {
-	uuidString := uuid.UUID(byteData).String()
+func (c *QValueAvroConverter) processUUID(byteData uuid.UUID) interface{} {
+	uuidString := byteData.String()
 	if c.Nullable {
 		return goavro.Union("string", uuidString)
 	}
 	return uuidString
+}
+
+func (c *QValueAvroConverter) processArrayUUID(arrayData []uuid.UUID) interface{} {
+	UUIDData := make([]string, 0, len(arrayData))
+	for _, uuid := range arrayData {
+		UUIDData = append(UUIDData, uuid.String())
+	}
+
+	if c.Nullable {
+		return goavro.Union("array", UUIDData)
+	}
+
+	return UUIDData
 }
 
 func (c *QValueAvroConverter) processGeospatial(geoString string) interface{} {

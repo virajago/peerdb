@@ -44,12 +44,12 @@ type cdcStore[Items model.Items] struct {
 	numRecordsSwitchThreshold int
 }
 
-func NewCDCStore[Items model.Items](ctx context.Context, flowJobName string) (*cdcStore[Items], error) {
-	numRecordsSwitchThreshold, err := peerdbenv.PeerDBCDCDiskSpillRecordsThreshold(ctx)
+func NewCDCStore[Items model.Items](ctx context.Context, env map[string]string, flowJobName string) (*cdcStore[Items], error) {
+	numRecordsSwitchThreshold, err := peerdbenv.PeerDBCDCDiskSpillRecordsThreshold(ctx, env)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CDC disk spill records threshold: %w", err)
 	}
-	memPercent, err := peerdbenv.PeerDBCDCDiskSpillMemPercentThreshold(ctx)
+	memPercent, err := peerdbenv.PeerDBCDCDiskSpillMemPercentThreshold(ctx, env)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CDC disk spill memory percent threshold: %w", err)
 	}
@@ -115,6 +115,7 @@ func init() {
 	gob.Register(qvalue.QValueArrayTimestamp{})
 	gob.Register(qvalue.QValueArrayTimestampTZ{})
 	gob.Register(qvalue.QValueArrayBoolean{})
+	gob.Register(qvalue.QValueTSTZRange{})
 }
 
 func (c *cdcStore[T]) initPebbleDB() error {
@@ -168,8 +169,7 @@ func (c *cdcStore[T]) Set(logger log.Logger, key model.TableWithPkey, rec model.
 			if c.pebbleDB == nil {
 				logger.Info(c.thresholdReason,
 					slog.String(string(shared.FlowNameKey), c.flowJobName))
-				err := c.initPebbleDB()
-				if err != nil {
+				if err := c.initPebbleDB(); err != nil {
 					return err
 				}
 			}

@@ -7,7 +7,7 @@
 
 [![Workflow Status](https://github.com/PeerDB-io/peerdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Peerdb-io/peerdb/actions/workflows/ci.yml)
 [![ElV2 License](https://badgen.net/badge/License/Elv2/green?icon=github)](https://github.com/PeerDB-io/peerdb/blob/main/LICENSE.md)
-[![Slack Community](https://img.shields.io/badge/slack-peerdb-brightgreen.svg?logo=slack)](https://join.slack.com/t/peerdb-public/shared_invite/zt-1wo9jydev-EXInbMtCtpAKFFWdi7QvLQ)
+[![Slack Community](https://img.shields.io/badge/slack-peerdb-brightgreen.svg?logo=slack)](https://slack.peerdb.io)
 
 </div>
 
@@ -53,6 +53,14 @@ PeerDB is an ETL/ELT tool built for PostgreSQL. We implement multiple Postgres n
 **For reliability**, we have mechanisms in place for fault tolerance - state management, automatic retries, handling idempotency and consistency and so on (<https://blog.peerdb.io/using-temporal-to-scale-data-synchronization-at-peerdb>) Configurable batching and parallelism prevent out of memory (OOMs) and crashes.
 
 **From a feature richness standpoint**, we support efficient syncing of tables with large (TOAST) columns. We support multiple streaming modes - Log based (CDC) based, Query based streaming etc. We provide rich data-type mapping and plan to support every possible (incl. Custom types) that Postgres supports to the best extent possible on the target data-store.
+
+### Now available natively in ClickHouse Cloud (Private Preview)
+
+PeerDB is now available natively in ClickHouse Cloud (Private Preview). Learn more about it [here](https://clickhouse.com/cloud/clickpipes/postgres-cdc-connector).
+
+<a href="https://clickhouse.com/cloud/clickpipes/postgres-cdc-connector">
+<img src="images/in-clickpipes.png" width="512" />
+</a>
 
 #### **Postgres-compatible SQL interface to do ETL**
 

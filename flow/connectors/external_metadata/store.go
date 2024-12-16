@@ -12,9 +12,10 @@ import (
 	"go.temporal.io/sdk/log"
 	"google.golang.org/protobuf/encoding/protojson"
 
+	"github.com/PeerDB-io/peer-flow/connectors/utils/monitoring"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
+	"github.com/PeerDB-io/peer-flow/shared"
 )
 
 const (
@@ -35,7 +36,7 @@ func NewPostgresMetadata(ctx context.Context) (*PostgresMetadata, error) {
 
 	return &PostgresMetadata{
 		pool:   pool,
-		logger: logger.LoggerFromCtx(ctx),
+		logger: shared.LoggerFromCtx(ctx),
 	}, nil
 }
 
@@ -170,12 +171,16 @@ func (p *PostgresMetadata) FinishBatch(ctx context.Context, jobName string, sync
 }
 
 func (p *PostgresMetadata) UpdateNormalizeBatchID(ctx context.Context, jobName string, batchID int64) error {
-	p.logger.Info("updating normalize batch id for job")
-	_, err := p.pool.Exec(ctx,
-		`UPDATE `+lastSyncStateTableName+
-			` SET normalize_batch_id=$2 WHERE job_name=$1`, jobName, batchID)
-	if err != nil {
-		p.logger.Error("failed to update normalize batch id", slog.Any("error", err))
+	p.logger.Info("updating normalize batch id for job", slog.Int64("batchID", batchID))
+	if _, err := p.pool.Exec(ctx,
+		`UPDATE `+lastSyncStateTableName+` SET normalize_batch_id=$2 WHERE job_name=$1`, jobName, batchID,
+	); err != nil {
+		p.logger.Error("failed to update normalize batch id", slog.Int64("batchID", batchID), slog.Any("error", err))
+		return err
+	}
+
+	if err := monitoring.UpdateEndTimeForCDCBatch(ctx, p.pool, jobName, batchID); err != nil {
+		p.logger.Error("failed to update end time for cdc batch", slog.Int64("batchID", batchID), slog.Any("error", err))
 		return err
 	}
 

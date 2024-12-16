@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/joho/godotenv"
 	"github.com/stretchr/testify/require"
 	"go.temporal.io/api/enums/v1"
@@ -27,7 +26,6 @@ import (
 	connsnowflake "github.com/PeerDB-io/peer-flow/connectors/snowflake"
 	"github.com/PeerDB-io/peer-flow/e2eshared"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/model/qvalue"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
@@ -91,7 +89,10 @@ func EnvTrue(t *testing.T, env WorkflowRun, val bool) {
 }
 
 func GetPgRows(conn *connpostgres.PostgresConnector, suffix string, table string, cols string) (*model.QRecordBatch, error) {
-	pgQueryExecutor := conn.NewQRepQueryExecutor("testflow", "testpart")
+	pgQueryExecutor, err := conn.NewQRepQueryExecutor(context.Background(), "testflow", "testpart")
+	if err != nil {
+		return nil, err
+	}
 
 	return pgQueryExecutor.ExecuteAndProcessQuery(
 		context.Background(),
@@ -170,13 +171,36 @@ func EnvWaitForEqualTablesWithNames(
 	})
 }
 
+func EnvWaitForCount(
+	env WorkflowRun,
+	suite RowSource,
+	reason string,
+	dstTable string,
+	cols string,
+	expectedCount int,
+) {
+	t := suite.T()
+	t.Helper()
+
+	EnvWaitFor(t, env, 3*time.Minute, reason, func() bool {
+		t.Helper()
+
+		rows, err := suite.GetRows(dstTable, cols)
+		if err != nil {
+			t.Log(err)
+			return false
+		}
+
+		return len(rows.Records) == expectedCount
+	})
+}
+
 func RequireEnvCanceled(t *testing.T, env WorkflowRun) {
 	t.Helper()
 	EnvWaitForFinished(t, env, time.Minute)
-	err := env.Error()
 	var panicErr *temporal.PanicError
 	var canceledErr *temporal.CanceledError
-	if err == nil {
+	if err := env.Error(); err == nil {
 		t.Fatal("Expected workflow to be canceled, not completed")
 	} else if errors.As(err, &panicErr) {
 		t.Fatalf("Workflow panic: %s %s", panicErr.Error(), panicErr.StackTrace())
@@ -195,10 +219,9 @@ func SetupCDCFlowStatusQuery(t *testing.T, env WorkflowRun, config *protos.FlowC
 		response, err := env.Query(shared.FlowStatusQuery, config.FlowJobName)
 		if err == nil {
 			var status protos.FlowStatus
-			err = response.Get(&status)
-			if err != nil {
+			if err := response.Get(&status); err != nil {
 				t.Fatal(err)
-			} else if status == protos.FlowStatus_STATUS_RUNNING {
+			} else if status == protos.FlowStatus_STATUS_RUNNING || status == protos.FlowStatus_STATUS_COMPLETED {
 				return
 			} else if counter > 30 {
 				env.Cancel()
@@ -278,17 +301,20 @@ func CreateTableForQRep(conn *pgx.Conn, suffix string, tableName string) error {
 		"mymac MACADDR",
 	}
 	tblFieldStr := strings.Join(tblFields, ",")
-	var pgErr *pgconn.PgError
 	_, enumErr := conn.Exec(context.Background(), createMoodEnum)
-	if errors.As(enumErr, &pgErr) && pgErr.Code != pgerrcode.DuplicateObject && !shared.IsUniqueError(pgErr) {
+	if enumErr != nil &&
+		!shared.IsSQLStateError(enumErr, pgerrcode.DuplicateObject, pgerrcode.UniqueViolation) {
 		return enumErr
 	}
 	_, err := conn.Exec(context.Background(), fmt.Sprintf(`
 		CREATE TABLE e2e_test_%s.%s (
 			%s
 		);`, suffix, tableName, tblFieldStr))
+	if err != nil {
+		return fmt.Errorf("error creating table for qrep tests: %w", err)
+	}
 
-	return err
+	return nil
 }
 
 func generate20MBJson() ([]byte, error) {
@@ -357,7 +383,7 @@ func PopulateSourceTable(conn *pgx.Conn, suffix string, tableName string, rowCou
 			) VALUES %s;
 	`, suffix, tableName, strings.Join(rows, ",")))
 	if err != nil {
-		return err
+		return fmt.Errorf("error populating source table with initial data: %w", err)
 	}
 
 	// add a row where all the nullable fields are null
@@ -541,7 +567,7 @@ func (tw *testWriter) Write(p []byte) (int, error) {
 func NewTemporalClient(t *testing.T) client.Client {
 	t.Helper()
 
-	logger := slog.New(logger.NewHandler(
+	logger := slog.New(shared.NewSlogHandler(
 		slog.NewJSONHandler(
 			&testWriter{t},
 			&slog.HandlerOptions{Level: slog.LevelWarn},
@@ -690,4 +716,22 @@ func EnvWaitForFinished(t *testing.T, env WorkflowRun, timeout time.Duration) {
 		}
 		return false
 	})
+}
+
+func EnvGetWorkflowState(t *testing.T, env WorkflowRun) peerflow.CDCFlowWorkflowState {
+	t.Helper()
+	var state peerflow.CDCFlowWorkflowState
+	val, err := env.Query(shared.CDCFlowStateQuery)
+	EnvNoError(t, env, err)
+	EnvNoError(t, env, val.Get(&state))
+	return state
+}
+
+func EnvGetFlowStatus(t *testing.T, env WorkflowRun) protos.FlowStatus {
+	t.Helper()
+	var flowStatus protos.FlowStatus
+	val, err := env.Query(shared.FlowStatusQuery)
+	EnvNoError(t, env, err)
+	EnvNoError(t, env, val.Get(&flowStatus))
+	return flowStatus
 }

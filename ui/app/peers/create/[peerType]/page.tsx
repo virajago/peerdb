@@ -2,7 +2,7 @@
 import { PeerConfig } from '@/app/dto/PeersDTO';
 import GuideForDestinationSetup from '@/app/mirrors/create/cdc/guide';
 import BigqueryForm from '@/components/PeerForms/BigqueryConfig';
-import ClickhouseForm from '@/components/PeerForms/ClickhouseConfig';
+import ClickHouseForm from '@/components/PeerForms/ClickhouseConfig';
 import KafkaForm from '@/components/PeerForms/KafkaConfig';
 import PostgresForm from '@/components/PeerForms/PostgresForm';
 import PubSubForm from '@/components/PeerForms/PubSubConfig';
@@ -48,14 +48,21 @@ export default function CreateConfig({
   const searchParams = useSearchParams();
   const peerName = searchParams.get('update');
   const blankSetting = getBlankSetting(peerType);
-  const [name, setName] = useState<string>(peerName ?? '');
+  const [name, setName] = useState<string>(
+    peerName ?? searchParams.get('name') ?? ''
+  );
   const [config, setConfig] = useState<PeerConfig>(blankSetting);
   const [loading, setLoading] = useState<boolean>(false);
   const peerLabel = peerType.toUpperCase().replaceAll('%20', ' ');
   const [nameValidityMessage, setNameValidityMessage] = useState<string>('');
 
   const getDBType = () => {
-    if (peerType.includes('POSTGRES') || peerType.includes('TEMBO')) {
+    if (
+      peerType.includes('POSTGRES') ||
+      peerType.includes('TEMBO') ||
+      peerType.includes('NEON') ||
+      peerType.includes('SUPABASE')
+    ) {
       return 'POSTGRES';
     }
     if (peerType === 'CONFLUENT' || peerType === 'REDPANDA') {
@@ -71,6 +78,7 @@ export default function CreateConfig({
           <PostgresForm
             settings={postgresSetting}
             setter={setConfig}
+            config={config}
             type={peerType}
           />
         );
@@ -80,7 +88,7 @@ export default function CreateConfig({
         return <BigqueryForm setter={setConfig} />;
       case 'CLICKHOUSE':
         return (
-          <ClickhouseForm settings={clickhouseSetting} setter={setConfig} />
+          <ClickHouseForm settings={clickhouseSetting} setter={setConfig} />
         );
       case 'S3':
         return <S3Form setter={setConfig} />;
@@ -150,7 +158,7 @@ export default function CreateConfig({
               {peerName === null && (
                 <Tooltip
                   style={{ width: '100%' }}
-                  content={'Peer name is a required field.'}
+                  content='Peer name is a required field.'
                 >
                   <Label colorName='lowContrast' colorSet='destructive'>
                     *

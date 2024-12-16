@@ -3,19 +3,42 @@ import { CopyButton } from '@/components/CopyButton';
 import TimeLabel from '@/components/TimeComponent';
 import { StatInfo } from '@/grpc_generated/route';
 import { Label } from '@/lib/Label';
+import { ProgressCircle } from '@/lib/ProgressCircle';
 import { SearchField } from '@/lib/SearchField';
 import { Table, TableCell, TableRow } from '@/lib/Table';
-import { useMemo, useState } from 'react';
-import { DurationDisplay } from './helpers';
+import { useEffect, useMemo, useState } from 'react';
+import { DurationDisplay, getStatData } from './helpers';
 import { tableStyle } from './style';
 
-const StatTable = ({ data }: { data: StatInfo[] }) => {
+const StatTable = ({ peerName }: { peerName: string }) => {
   const [search, setSearch] = useState('');
+  const [data, setData] = useState<StatInfo[]>([]);
   const filteredData = useMemo(() => {
     return data.filter((stat) => {
       return stat.query.toLowerCase().includes(search.toLowerCase());
     });
   }, [data, search]);
+
+  useEffect(() => {
+    getStatData(peerName).then((stats) => {
+      setData(stats);
+    });
+  }, [peerName]);
+
+  if (!data || data.length === 0) {
+    return (
+      <div style={{ minHeight: '10%' }}>
+        <Label
+          as='label'
+          variant='subheadline'
+          style={{ marginBottom: '1rem', fontWeight: 'bold' }}
+        >
+          Stat Activity Information
+        </Label>
+        <ProgressCircle variant='determinate_progress_circle' />
+      </div>
+    );
+  }
 
   return (
     <div style={{ minHeight: '10%' }}>
@@ -33,6 +56,7 @@ const StatTable = ({ data }: { data: StatInfo[] }) => {
               {[
                 'PID',
                 'Duration',
+                'State',
                 'Wait Event',
                 'Wait Event Type',
                 'Start Time',
@@ -71,6 +95,11 @@ const StatTable = ({ data }: { data: StatInfo[] }) => {
               <TableCell>
                 <Label as='label' style={{ fontSize: 14 }}>
                   <DurationDisplay duration={stat.duration} />
+                </Label>
+              </TableCell>
+              <TableCell>
+                <Label as='label' style={{ fontSize: 14 }}>
+                  {stat.state || 'N/A'}
                 </Label>
               </TableCell>
               <TableCell>

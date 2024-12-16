@@ -18,6 +18,10 @@ export const DBTypeToImageMapping = (peerType: DBType | string) => {
       return '/images/tembo.png';
     case 'CRUNCHY POSTGRES':
       return '/images/crunchy.png';
+    case 'NEON':
+      return '/images/neon.png';
+    case 'SUPABASE':
+      return '/svgs/supabase-logo-icon.svg';
     case DBType.POSTGRES:
     case 'POSTGRES':
       return '/svgs/pg.svg';
@@ -55,13 +59,13 @@ export const DBTypeToImageMapping = (peerType: DBType | string) => {
   }
 };
 
-const PeerButton = ({
+export default function PeerButton({
   peerName,
   peerType,
 }: {
   peerName: string;
   peerType: DBType;
-}) => {
+}) {
   const router = useRouter();
   const [isLoading, setIsLoading] = useState(false);
 
@@ -92,6 +96,4 @@ const PeerButton = ({
       <Label>{peerName}</Label>
     </Button>
   );
-};
-
-export default PeerButton;
+}

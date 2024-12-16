@@ -10,18 +10,18 @@ interface ColumnProps {
   tableRow: TableMapRow;
   rows: TableMapRow[];
   setRows: Dispatch<SetStateAction<TableMapRow[]>>;
+  disabled?: boolean;
+  showOrdering: boolean;
 }
 export default function ColumnBox({
   columns,
   tableRow,
   rows,
   setRows,
+  disabled,
 }: ColumnProps) {
-  const handleColumnExclusion = (
-    source: string,
-    column: string,
-    include: boolean
-  ) => {
+  const handleColumnExclusion = (column: string, include: boolean) => {
+    const source = tableRow.source;
     const currRows = [...rows];
     const rowIndex = currRows.findIndex((row) => row.source === source);
     if (rowIndex !== -1) {
@@ -40,13 +40,17 @@ export default function ColumnBox({
     }
   };
 
-  const columnExclusion = new Set(tableRow.exclude);
   return columns.map((column) => {
     const [columnName, columnType, isPkeyStr] = column.split(':');
     const isPkey = isPkeyStr === 'true';
+    const partOfOrderingKey = rows
+      .find((row) => row.source == tableRow.source)
+      ?.columns.some(
+        (col) => col.sourceName === columnName && col.ordering <= 0
+      );
     return (
       <RowWithCheckbox
-        key={column}
+        key={columnName}
         label={
           <Label
             as='label'
@@ -70,10 +74,10 @@ export default function ColumnBox({
         action={
           <Checkbox
             style={{ cursor: 'pointer' }}
-            disabled={isPkey}
-            checked={!columnExclusion.has(columnName)}
+            disabled={isPkey || disabled || partOfOrderingKey}
+            checked={!tableRow.exclude.has(columnName)}
             onCheckedChange={(state: boolean) =>
-              handleColumnExclusion(tableRow.source, columnName, state)
+              handleColumnExclusion(columnName, state)
             }
           />
         }

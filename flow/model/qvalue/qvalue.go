@@ -6,7 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
-	"github.com/yuin/gopher-lua"
+	lua "github.com/yuin/gopher-lua"
 
 	"github.com/PeerDB-io/glua64"
 	"github.com/PeerDB-io/peer-flow/shared"
@@ -294,6 +294,22 @@ func (v QValueInterval) LValue(ls *lua.LState) lua.LValue {
 	return lua.LString(v.Val)
 }
 
+type QValueTSTZRange struct {
+	Val string
+}
+
+func (QValueTSTZRange) Kind() QValueKind {
+	return QValueKindInterval
+}
+
+func (v QValueTSTZRange) Value() any {
+	return v.Val
+}
+
+func (v QValueTSTZRange) LValue(ls *lua.LState) lua.LValue {
+	return lua.LString(v.Val)
+}
+
 type QValueNumeric struct {
 	Val decimal.Decimal
 }
@@ -327,7 +343,7 @@ func (v QValueBytes) LValue(ls *lua.LState) lua.LValue {
 }
 
 type QValueUUID struct {
-	Val [16]byte
+	Val uuid.UUID
 }
 
 func (QValueUUID) Kind() QValueKind {
@@ -339,11 +355,30 @@ func (v QValueUUID) Value() any {
 }
 
 func (v QValueUUID) LValue(ls *lua.LState) lua.LValue {
-	return shared.LuaUuid.New(ls, uuid.UUID(v.Val))
+	return shared.LuaUuid.New(ls, v.Val)
+}
+
+type QValueArrayUUID struct {
+	Val []uuid.UUID
+}
+
+func (QValueArrayUUID) Kind() QValueKind {
+	return QValueKindArrayUUID
+}
+
+func (v QValueArrayUUID) Value() any {
+	return v.Val
+}
+
+func (v QValueArrayUUID) LValue(ls *lua.LState) lua.LValue {
+	return shared.SliceToLTable(ls, v.Val, func(x uuid.UUID) lua.LValue {
+		return shared.LuaUuid.New(ls, x)
+	})
 }
 
 type QValueJSON struct {
-	Val string
+	Val     string
+	IsArray bool
 }
 
 func (QValueJSON) Kind() QValueKind {

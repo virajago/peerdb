@@ -53,7 +53,7 @@ func (s SnowflakeSchemaDeltaTestSuite) TestSimpleAddColumn() {
 	err := s.sfTestHelper.RunCommand(fmt.Sprintf("CREATE TABLE %s(ID TEXT PRIMARY KEY)", tableName))
 	require.NoError(s.t, err)
 
-	err = s.connector.ReplayTableSchemaDeltas(context.Background(), "schema_delta_flow", []*protos.TableSchemaDelta{{
+	err = s.connector.ReplayTableSchemaDeltas(context.Background(), nil, "schema_delta_flow", []*protos.TableSchemaDelta{{
 		SrcTableName: tableName,
 		DstTableName: tableName,
 		AddedColumns: []*protos.FieldDescription{
@@ -66,9 +66,7 @@ func (s SnowflakeSchemaDeltaTestSuite) TestSimpleAddColumn() {
 	}})
 	require.NoError(s.t, err)
 
-	output, err := s.connector.GetTableSchema(context.Background(), &protos.GetTableSchemaBatchInput{
-		TableIdentifiers: []string{tableName},
-	})
+	output, err := s.connector.GetTableSchema(context.Background(), nil, protos.TypeSystem_Q, []string{tableName})
 	require.NoError(s.t, err)
 	require.Equal(s.t, &protos.TableSchema{
 		TableIdentifier: tableName,
@@ -84,7 +82,7 @@ func (s SnowflakeSchemaDeltaTestSuite) TestSimpleAddColumn() {
 				TypeModifier: -1,
 			},
 		},
-	}, output.TableNameSchemaMapping[tableName])
+	}, output[tableName])
 }
 
 func (s SnowflakeSchemaDeltaTestSuite) TestAddAllColumnTypes() {
@@ -169,18 +167,16 @@ func (s SnowflakeSchemaDeltaTestSuite) TestAddAllColumnTypes() {
 		}
 	}
 
-	err = s.connector.ReplayTableSchemaDeltas(context.Background(), "schema_delta_flow", []*protos.TableSchemaDelta{{
+	err = s.connector.ReplayTableSchemaDeltas(context.Background(), nil, "schema_delta_flow", []*protos.TableSchemaDelta{{
 		SrcTableName: tableName,
 		DstTableName: tableName,
 		AddedColumns: addedColumns,
 	}})
 	require.NoError(s.t, err)
 
-	output, err := s.connector.GetTableSchema(context.Background(), &protos.GetTableSchemaBatchInput{
-		TableIdentifiers: []string{tableName},
-	})
+	output, err := s.connector.GetTableSchema(context.Background(), nil, protos.TypeSystem_Q, []string{tableName})
 	require.NoError(s.t, err)
-	require.Equal(s.t, expectedTableSchema, output.TableNameSchemaMapping[tableName])
+	require.Equal(s.t, expectedTableSchema, output[tableName])
 }
 
 func (s SnowflakeSchemaDeltaTestSuite) TestAddTrickyColumnNames() {
@@ -250,18 +246,16 @@ func (s SnowflakeSchemaDeltaTestSuite) TestAddTrickyColumnNames() {
 		}
 	}
 
-	err = s.connector.ReplayTableSchemaDeltas(context.Background(), "schema_delta_flow", []*protos.TableSchemaDelta{{
+	err = s.connector.ReplayTableSchemaDeltas(context.Background(), nil, "schema_delta_flow", []*protos.TableSchemaDelta{{
 		SrcTableName: tableName,
 		DstTableName: tableName,
 		AddedColumns: addedColumns,
 	}})
 	require.NoError(s.t, err)
 
-	output, err := s.connector.GetTableSchema(context.Background(), &protos.GetTableSchemaBatchInput{
-		TableIdentifiers: []string{tableName},
-	})
+	output, err := s.connector.GetTableSchema(context.Background(), nil, protos.TypeSystem_Q, []string{tableName})
 	require.NoError(s.t, err)
-	require.Equal(s.t, expectedTableSchema, output.TableNameSchemaMapping[tableName])
+	require.Equal(s.t, expectedTableSchema, output[tableName])
 }
 
 func (s SnowflakeSchemaDeltaTestSuite) TestAddWhitespaceColumnNames() {
@@ -307,18 +301,16 @@ func (s SnowflakeSchemaDeltaTestSuite) TestAddWhitespaceColumnNames() {
 		}
 	}
 
-	err = s.connector.ReplayTableSchemaDeltas(context.Background(), "schema_delta_flow", []*protos.TableSchemaDelta{{
+	err = s.connector.ReplayTableSchemaDeltas(context.Background(), nil, "schema_delta_flow", []*protos.TableSchemaDelta{{
 		SrcTableName: tableName,
 		DstTableName: tableName,
 		AddedColumns: addedColumns,
 	}})
 	require.NoError(s.t, err)
 
-	output, err := s.connector.GetTableSchema(context.Background(), &protos.GetTableSchemaBatchInput{
-		TableIdentifiers: []string{tableName},
-	})
+	output, err := s.connector.GetTableSchema(context.Background(), nil, protos.TypeSystem_Q, []string{tableName})
 	require.NoError(s.t, err)
-	require.Equal(s.t, expectedTableSchema, output.TableNameSchemaMapping[tableName])
+	require.Equal(s.t, expectedTableSchema, output[tableName])
 }
 
 func (s SnowflakeSchemaDeltaTestSuite) Teardown() {

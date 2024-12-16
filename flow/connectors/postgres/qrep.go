@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"go.temporal.io/sdk/log"
@@ -19,7 +20,6 @@ import (
 	"github.com/PeerDB-io/peer-flow/connectors/utils"
 	partition_utils "github.com/PeerDB-io/peer-flow/connectors/utils/partition"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/shared"
 )
@@ -84,7 +84,6 @@ func (c *PostgresConnector) getNumRowsPartitions(
 	config *protos.QRepConfig,
 	last *protos.QRepPartition,
 ) ([]*protos.QRepPartition, error) {
-	var err error
 	numRowsPerPartition := int64(config.NumRowsPerPartition)
 	quotedWatermarkColumn := QuoteIdentifier(config.WatermarkColumn)
 
@@ -116,7 +115,7 @@ func (c *PostgresConnector) getNumRowsPartitions(
 	}
 
 	var totalRows pgtype.Int8
-	if err = row.Scan(&totalRows); err != nil {
+	if err := row.Scan(&totalRows); err != nil {
 		return nil, fmt.Errorf("failed to query for total rows: %w", err)
 	}
 
@@ -165,8 +164,7 @@ func (c *PostgresConnector) getNumRowsPartitions(
 		rows, err = tx.Query(ctx, partitionsQuery)
 	}
 	if err != nil {
-		c.logger.Error(fmt.Sprintf("failed to query for partitions: %v", err))
-		return nil, fmt.Errorf("failed to query for partitions: %w", err)
+		return nil, shared.LogError(c.logger, fmt.Errorf("failed to query for partitions: %w", err))
 	}
 	defer rows.Close()
 
@@ -178,19 +176,16 @@ func (c *PostgresConnector) getNumRowsPartitions(
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
 
-		err = partitionHelper.AddPartition(start, end)
-		if err != nil {
+		if err := partitionHelper.AddPartition(start, end); err != nil {
 			return nil, fmt.Errorf("failed to add partition: %w", err)
 		}
 	}
 
-	err = rows.Err()
-	if err != nil {
+	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to read rows: %w", err)
 	}
 
-	err = tx.Commit(ctx)
-	if err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
@@ -239,7 +234,7 @@ func (c *PostgresConnector) getMinMaxValues(
 	} else {
 		minMaxQuery := fmt.Sprintf("SELECT MIN(%[1]s), MAX(%[1]s) FROM %[2]s", quotedWatermarkColumn, parsedWatermarkTable.String())
 		if err := tx.QueryRow(ctx, minMaxQuery).Scan(&minValue, &maxValue); err != nil {
-			c.logger.Error(fmt.Sprintf("failed to query [%s] for min value: %v", minMaxQuery, err))
+			c.logger.Error("failed to query for min value", slog.String("query", minMaxQuery), slog.Any("error", err))
 			return nil, nil, fmt.Errorf("failed to query for min value: %w", err)
 		} else if maxValue != nil {
 			switch v := minValue.(type) {
@@ -333,10 +328,15 @@ func corePullQRepRecords(
 	sink QRepPullSink,
 ) (int, error) {
 	partitionIdLog := slog.String(string(shared.PartitionIDKey), partition.PartitionId)
+
 	if partition.FullTablePartition {
 		c.logger.Info("pulling full table partition", partitionIdLog)
-		executor := c.NewQRepQueryExecutorSnapshot(config.SnapshotName, config.FlowJobName, partition.PartitionId)
-		_, err := executor.ExecuteQueryIntoSink(ctx, sink, config.Query)
+		executor, err := c.NewQRepQueryExecutorSnapshot(ctx, config.SnapshotName,
+			config.FlowJobName, partition.PartitionId)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create query executor: %w", err)
+		}
+		_, err = executor.ExecuteQueryIntoSink(ctx, sink, config.Query)
 		return 0, err
 	}
 	c.logger.Info("Obtained ranges for partition for PullQRepStream", partitionIdLog)
@@ -374,7 +374,11 @@ func corePullQRepRecords(
 		return 0, err
 	}
 
-	executor := c.NewQRepQueryExecutorSnapshot(config.SnapshotName, config.FlowJobName, partition.PartitionId)
+	executor, err := c.NewQRepQueryExecutorSnapshot(ctx, config.SnapshotName, config.FlowJobName,
+		partition.PartitionId)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create query executor: %w", err)
+	}
 
 	numRecords, err := executor.ExecuteQueryIntoSink(ctx, sink, query, rangeStart, rangeEnd)
 	if err != nil {
@@ -459,7 +463,7 @@ func syncQRepRecords(
 	defer func() {
 		if err := tx.Rollback(context.Background()); err != nil {
 			if err != pgx.ErrTxClosed {
-				logger.LoggerFromCtx(ctx).Error("failed to rollback transaction tx2", slog.Any("error", err), syncLog)
+				shared.LoggerFromCtx(ctx).Error("failed to rollback transaction tx2", slog.Any("error", err), syncLog)
 			}
 		}
 	}()
@@ -632,7 +636,7 @@ func (c *PostgresConnector) SetupQRepMetadataTables(ctx context.Context, config 
 	)`, metadataTableIdentifier.Sanitize())
 	// execute create table query
 	_, err = c.execWithLogging(ctx, createQRepMetadataTableSQL)
-	if err != nil && !shared.IsUniqueError(err) {
+	if err != nil && !shared.IsSQLStateError(err, pgerrcode.UniqueViolation) {
 		return fmt.Errorf("failed to create table %s: %w", qRepMetadataTableName, err)
 	}
 	c.logger.Info("Setup metadata table.")
@@ -674,7 +678,11 @@ func pullXminRecordStream(
 		queryArgs = []interface{}{strconv.FormatInt(partition.Range.Range.(*protos.PartitionRange_IntRange).IntRange.Start&0xffffffff, 10)}
 	}
 
-	executor := c.NewQRepQueryExecutorSnapshot(config.SnapshotName, config.FlowJobName, partition.PartitionId)
+	executor, err := c.NewQRepQueryExecutorSnapshot(ctx, config.SnapshotName,
+		config.FlowJobName, partition.PartitionId)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create query executor: %w", err)
+	}
 
 	numRecords, currentSnapshotXmin, err := executor.ExecuteQueryIntoSinkGettingCurrentSnapshotXmin(
 		ctx,
@@ -705,7 +713,7 @@ func BuildQuery(logger log.Logger, query string, flowJobName string) (string, er
 	}
 	res := buf.String()
 
-	logger.Info("templated query: " + res)
+	logger.Info("[pg] templated query", slog.String("query", res))
 	return res, nil
 }
 

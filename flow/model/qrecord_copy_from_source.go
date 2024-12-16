@@ -1,6 +1,7 @@
 package model
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -82,12 +83,20 @@ func (src *QRecordCopyFromSource) Values() ([]interface{}, error) {
 			values[i] = str
 		case qvalue.QValueTime:
 			values[i] = pgtype.Time{Microseconds: v.Val.UnixMicro(), Valid: true}
+		case qvalue.QValueTSTZRange:
+			values[i] = v.Val
 		case qvalue.QValueTimestamp:
 			values[i] = pgtype.Timestamp{Time: v.Val, Valid: true}
 		case qvalue.QValueTimestampTZ:
 			values[i] = pgtype.Timestamptz{Time: v.Val, Valid: true}
 		case qvalue.QValueUUID:
-			values[i] = uuid.UUID(v.Val)
+			values[i] = v.Val
+		case qvalue.QValueArrayUUID:
+			a, err := constructArray[uuid.UUID](qValue, "ArrayUUID")
+			if err != nil {
+				return nil, err
+			}
+			values[i] = a
 		case qvalue.QValueNumeric:
 			values[i] = v.Val
 		case qvalue.QValueBytes:
@@ -170,8 +179,16 @@ func (src *QRecordCopyFromSource) Values() ([]interface{}, error) {
 			}
 			values[i] = a
 		case qvalue.QValueJSON:
-			values[i] = v.Val
+			if v.IsArray {
+				var arrayJ []interface{}
+				if err := json.Unmarshal([]byte(v.Value().(string)), &arrayJ); err != nil {
+					return nil, fmt.Errorf("failed to unmarshal JSON array: %v", err)
+				}
 
+				values[i] = arrayJ
+			} else {
+				values[i] = v.Value()
+			}
 		// And so on for the other types...
 		default:
 			return nil, fmt.Errorf("unsupported value type %T", qValue)

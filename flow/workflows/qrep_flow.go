@@ -32,13 +32,15 @@ type QRepPartitionFlowExecution struct {
 	runUUID         string
 }
 
+var InitialLastPartition = &protos.QRepPartition{
+	PartitionId: "not-applicable-partition",
+	Range:       nil,
+}
+
 // returns a new empty QRepFlowState
 func newQRepFlowState() *protos.QRepFlowState {
 	return &protos.QRepFlowState{
-		LastPartition: &protos.QRepPartition{
-			PartitionId: "not-applicable-partition",
-			Range:       nil,
-		},
+		LastPartition:          InitialLastPartition,
 		NumPartitionsProcessed: 0,
 		NeedsResync:            true,
 		CurrentFlowStatus:      protos.FlowStatus_STATUS_RUNNING,
@@ -89,7 +91,7 @@ func (q *QRepFlowExecution) SetupMetadataTables(ctx workflow.Context) error {
 	return nil
 }
 
-func (q *QRepFlowExecution) getTableSchema(ctx workflow.Context, tableName string) (*protos.TableSchema, error) {
+func (q *QRepFlowExecution) setupTableSchema(ctx workflow.Context, tableName string) error {
 	q.logger.Info("fetching schema for table", slog.String("table", tableName))
 
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
@@ -103,21 +105,21 @@ func (q *QRepFlowExecution) getTableSchema(ctx workflow.Context, tableName strin
 		},
 	})
 
-	tableSchemaInput := &protos.GetTableSchemaBatchInput{
+	tableSchemaInput := &protos.SetupTableSchemaBatchInput{
 		PeerName:         q.config.SourceName,
 		TableIdentifiers: []string{tableName},
-		FlowName:         q.config.FlowJobName,
-		System:           q.config.System,
+		TableMappings: []*protos.TableMapping{
+			{
+				SourceTableIdentifier:      tableName,
+				DestinationTableIdentifier: q.config.DestinationTableIdentifier,
+			},
+		},
+		FlowName: q.config.FlowJobName,
+		System:   q.config.System,
+		Env:      q.config.Env,
 	}
 
-	future := workflow.ExecuteActivity(ctx, flowable.GetTableSchema, tableSchemaInput)
-
-	var tblSchemaOutput *protos.GetTableSchemaBatchOutput
-	if err := future.Get(ctx, &tblSchemaOutput); err != nil {
-		return nil, fmt.Errorf("failed to fetch schema for table %s: %w", tableName, err)
-	}
-
-	return tblSchemaOutput.TableNameSchemaMapping[tableName], nil
+	return workflow.ExecuteActivity(ctx, flowable.SetupTableSchema, tableSchemaInput).Get(ctx, nil)
 }
 
 func (q *QRepFlowExecution) setupWatermarkTableOnDestination(ctx workflow.Context) error {
@@ -136,8 +138,7 @@ func (q *QRepFlowExecution) setupWatermarkTableOnDestination(ctx workflow.Contex
 		})
 
 		// fetch the schema for the watermark table
-		watermarkTableSchema, err := q.getTableSchema(ctx, q.config.WatermarkTable)
-		if err != nil {
+		if err := q.setupTableSchema(ctx, q.config.WatermarkTable); err != nil {
 			q.logger.Error("failed to fetch schema for watermark table", slog.Any("error", err))
 			return fmt.Errorf("failed to fetch schema for watermark table: %w", err)
 		}
@@ -145,17 +146,21 @@ func (q *QRepFlowExecution) setupWatermarkTableOnDestination(ctx workflow.Contex
 		// now setup the normalized tables on the destination peer
 		setupConfig := &protos.SetupNormalizedTableBatchInput{
 			PeerName: q.config.DestinationName,
-			TableNameSchemaMapping: map[string]*protos.TableSchema{
-				q.config.DestinationTableIdentifier: watermarkTableSchema,
+			TableMappings: []*protos.TableMapping{
+				{
+					SourceTableIdentifier:      q.config.WatermarkTable,
+					DestinationTableIdentifier: q.config.DestinationTableIdentifier,
+				},
 			},
 			SyncedAtColName:   q.config.SyncedAtColName,
 			SoftDeleteColName: q.config.SoftDeleteColName,
 			FlowName:          q.config.FlowJobName,
+			Env:               q.config.Env,
+			IsResync:          q.config.DstTableFullResync,
 		}
 
-		future := workflow.ExecuteActivity(ctx, flowable.CreateNormalizedTable, setupConfig)
-		if err := future.Get(ctx, nil); err != nil {
-			q.logger.Error("failed to create watermark table: ", err)
+		if err := workflow.ExecuteActivity(ctx, flowable.CreateNormalizedTable, setupConfig).Get(ctx, nil); err != nil {
+			q.logger.Error("failed to create watermark table", slog.Any("error", err))
 			return fmt.Errorf("failed to create watermark table: %w", err)
 		}
 		q.logger.Info("finished setting up watermark table for qrep flow")
@@ -236,9 +241,7 @@ func (q *QRepFlowExecution) startChildWorkflow(
 		RetryPolicy: &temporal.RetryPolicy{
 			MaximumAttempts: 20,
 		},
-		SearchAttributes: map[string]interface{}{
-			shared.MirrorNameSearchAttribute: q.config.FlowJobName,
-		},
+		TypedSearchAttributes: shared.NewSearchAttributes(q.config.FlowJobName),
 	})
 
 	return workflow.ExecuteChildWorkflow(partFlowCtx, QRepPartitionWorkflow, q.config, partitions, q.runUUID)
@@ -323,10 +326,8 @@ func (q *QRepFlowExecution) waitForNewRows(
 	lastPartition *protos.QRepPartition,
 ) error {
 	ctx = workflow.WithChildOptions(ctx, workflow.ChildWorkflowOptions{
-		ParentClosePolicy: enums.PARENT_CLOSE_POLICY_REQUEST_CANCEL,
-		SearchAttributes: map[string]interface{}{
-			shared.MirrorNameSearchAttribute: q.config.FlowJobName,
-		},
+		ParentClosePolicy:     enums.PARENT_CLOSE_POLICY_REQUEST_CANCEL,
+		TypedSearchAttributes: shared.NewSearchAttributes(q.config.FlowJobName),
 	})
 	future := workflow.ExecuteChildWorkflow(ctx, QRepWaitForNewRowsWorkflow, q.config, lastPartition)
 
@@ -389,8 +390,7 @@ func (q *QRepFlowExecution) handleTableRenameForResync(ctx workflow.Context, sta
 			PeerName:    q.config.DestinationName,
 		}
 
-		tblSchema, err := q.getTableSchema(ctx, q.config.DestinationTableIdentifier)
-		if err != nil {
+		if err := q.setupTableSchema(ctx, q.config.DestinationTableIdentifier); err != nil {
 			return fmt.Errorf("failed to fetch schema for table %s: %w", q.config.DestinationTableIdentifier, err)
 		}
 
@@ -398,7 +398,6 @@ func (q *QRepFlowExecution) handleTableRenameForResync(ctx workflow.Context, sta
 			{
 				CurrentName: q.config.DestinationTableIdentifier,
 				NewName:     oldTableIdentifier,
-				TableSchema: tblSchema,
 			},
 		}
 
@@ -464,8 +463,10 @@ func QRepWaitForNewRowsWorkflow(ctx workflow.Context, config *protos.QRepConfig,
 		return fmt.Errorf("error checking for new rows: %w", err)
 	}
 
+	optedForOverwrite := config.WriteMode.WriteType == protos.QRepWriteType_QREP_WRITE_MODE_OVERWRITE
+	fullRefresh := optedForOverwrite && getQRepOverwriteFullRefreshMode(ctx, logger, config.Env)
 	// If no new rows are found, continue as new
-	if !hasNewRows {
+	if !hasNewRows || fullRefresh {
 		waitBetweenBatches := 5 * time.Second
 		if config.WaitBetweenBatchesSeconds > 0 {
 			waitBetweenBatches = time.Duration(config.WaitBetweenBatchesSeconds) * time.Second
@@ -475,6 +476,9 @@ func QRepWaitForNewRowsWorkflow(ctx workflow.Context, config *protos.QRepConfig,
 			return sleepErr
 		}
 
+		if fullRefresh {
+			return nil
+		}
 		logger.Info("QRepWaitForNewRowsWorkflow: continuing the loop")
 		return workflow.NewContinueAsNewError(ctx, QRepWaitForNewRowsWorkflow, config, lastPartition)
 	}
@@ -504,13 +508,11 @@ func QRepFlowWorkflow(
 		state = newQRepFlowState()
 	}
 
-	err := setWorkflowQueries(ctx, state)
-	if err != nil {
+	if err := setWorkflowQueries(ctx, state); err != nil {
 		return state, err
 	}
 
 	signalChan := model.FlowSignal.GetSignalChannel(ctx)
-
 	q := newQRepFlowExecution(ctx, config, originalRunID)
 
 	if state.CurrentFlowStatus == protos.FlowStatus_STATUS_PAUSING ||
@@ -537,24 +539,29 @@ func QRepFlowWorkflow(
 		maxParallelWorkers = int(config.MaxParallelWorkers)
 	}
 
-	err = q.setupWatermarkTableOnDestination(ctx)
-	if err != nil {
+	if err := q.setupWatermarkTableOnDestination(ctx); err != nil {
 		return state, fmt.Errorf("failed to setup watermark table: %w", err)
 	}
 
-	err = q.SetupMetadataTables(ctx)
-	if err != nil {
+	if err := q.SetupMetadataTables(ctx); err != nil {
 		return state, fmt.Errorf("failed to setup metadata tables: %w", err)
 	}
 	q.logger.Info("metadata tables setup for peer flow")
 
-	err = q.handleTableCreationForResync(ctx, state)
-	if err != nil {
+	if err := q.handleTableCreationForResync(ctx, state); err != nil {
 		return state, err
 	}
 
-	if !config.InitialCopyOnly && state.LastPartition != nil {
-		if err := q.waitForNewRows(ctx, signalChan, state.LastPartition); err != nil {
+	fullRefresh := false
+	lastPartition := state.LastPartition
+	if config.WriteMode.WriteType == protos.QRepWriteType_QREP_WRITE_MODE_OVERWRITE {
+		if fullRefresh = getQRepOverwriteFullRefreshMode(ctx, q.logger, config.Env); fullRefresh {
+			lastPartition = InitialLastPartition
+		}
+	}
+
+	if !config.InitialCopyOnly && lastPartition != nil {
+		if err := q.waitForNewRows(ctx, signalChan, lastPartition); err != nil {
 			return state, err
 		}
 	}
@@ -581,15 +588,14 @@ func QRepFlowWorkflow(
 			return state, nil
 		}
 
-		err = q.handleTableRenameForResync(ctx, state)
-		if err != nil {
+		if err := q.handleTableRenameForResync(ctx, state); err != nil {
 			return state, err
 		}
 
 		q.logger.Info(fmt.Sprintf("%d partitions processed", len(partitions.Partitions)))
 		state.NumPartitionsProcessed += uint64(len(partitions.Partitions))
 
-		if len(partitions.Partitions) > 0 {
+		if len(partitions.Partitions) > 0 && !fullRefresh {
 			state.LastPartition = partitions.Partitions[len(partitions.Partitions)-1]
 		}
 	}

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/shared"
 )
 
@@ -53,7 +52,7 @@ func (r *CDCStream[T]) AddRecord(ctx context.Context, record Record[T]) error {
 		}
 	}
 
-	logger := logger.LoggerFromCtx(ctx)
+	logger := shared.LoggerFromCtx(ctx)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -62,9 +61,9 @@ func (r *CDCStream[T]) AddRecord(ctx context.Context, record Record[T]) error {
 		case r.records <- record:
 			return nil
 		case <-ticker.C:
-			logger.Warn("waiting on adding record to stream", slog.Any("record", record))
+			logger.Warn("waiting on adding record to stream", slog.String("dstTableName", record.GetDestinationTableName()))
 		case <-ctx.Done():
-			logger.Warn("context cancelled while adding record to stream", slog.Any("record", record))
+			logger.Warn("context cancelled while adding record to stream", slog.String("dstTableName", record.GetDestinationTableName()))
 			return ctx.Err()
 		}
 	}

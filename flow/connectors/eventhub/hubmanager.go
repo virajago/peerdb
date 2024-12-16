@@ -14,9 +14,9 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/eventhub/armeventhub"
 	cmap "github.com/orcaman/concurrent-map/v2"
 
-	"github.com/PeerDB-io/peer-flow/connectors/utils"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
+	"github.com/PeerDB-io/peer-flow/peerdbenv"
+	"github.com/PeerDB-io/peer-flow/shared"
 )
 
 type EventHubManager struct {
@@ -65,7 +65,7 @@ func (m *EventHubManager) GetOrCreateHubClient(ctx context.Context, name ScopedE
 		hubTmp := hub.(*azeventhubs.ProducerClient)
 		_, err := hubTmp.GetEventHubProperties(ctx, nil)
 		if err != nil {
-			logger := logger.LoggerFromCtx(ctx)
+			logger := shared.LoggerFromCtx(ctx)
 			logger.Info(
 				fmt.Sprintf("eventhub %s not reachable. Will re-establish connection and re-create it.", name),
 				slog.Any("error", err))
@@ -111,7 +111,7 @@ func (m *EventHubManager) Close(ctx context.Context) error {
 		hub := value.(*azeventhubs.ProducerClient)
 		err := m.closeProducerClient(ctx, hub)
 		if err != nil {
-			logger.LoggerFromCtx(ctx).Error(fmt.Sprintf("failed to close eventhub client for %v", name), slog.Any("error", err))
+			shared.LoggerFromCtx(ctx).Error(fmt.Sprintf("failed to close eventhub client for %v", name), slog.Any("error", err))
 			allErrors = errors.Join(allErrors, err)
 		}
 		return true
@@ -161,7 +161,7 @@ func (m *EventHubManager) EnsureEventHubExists(ctx context.Context, name ScopedE
 
 	partitionCount := int64(cfg.PartitionCount)
 	retention := int64(cfg.MessageRetentionInDays)
-	logger := logger.LoggerFromCtx(ctx)
+	logger := shared.LoggerFromCtx(ctx)
 	if err != nil {
 		opts := armeventhub.Eventhub{
 			Properties: &armeventhub.Properties{
@@ -186,10 +186,10 @@ func (m *EventHubManager) EnsureEventHubExists(ctx context.Context, name ScopedE
 
 func (m *EventHubManager) getEventHubMgmtClient(subID string) (*armeventhub.EventHubsClient, error) {
 	if subID == "" {
-		envSubID, err := utils.GetAzureSubscriptionID()
-		if err != nil {
-			slog.Error("failed to get azure subscription id", slog.Any("error", err))
-			return nil, err
+		envSubID := peerdbenv.GetEnvString("AZURE_SUBSCRIPTION_ID", "")
+		if envSubID == "" {
+			slog.Error("couldn't find AZURE_SUBSCRIPTION_ID in environment")
+			return nil, errors.New("couldn't find AZURE_SUBSCRIPTION_ID in environment")
 		}
 		subID = envSubID
 	}

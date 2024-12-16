@@ -1,6 +1,6 @@
-# syntax=docker/dockerfile:1.2
+# syntax=docker/dockerfile:1.12@sha256:db1ff77fb637a5955317c7a3a62540196396d565f3dd5742e76dddbb6d75c4c5
 
-FROM golang:1.22-alpine AS builder
+FROM golang:1.23-alpine@sha256:6c5c9590f169f77c8046e45c611d3b28fe477789acd8d3762d23d4744de69812 AS builder
 RUN apk add --no-cache gcc geos-dev musl-dev
 WORKDIR /root/flow
 
@@ -18,7 +18,7 @@ WORKDIR /root/flow
 ENV CGO_ENABLED=1
 RUN go build -ldflags="-s -w" -o /root/peer-flow
 
-FROM alpine:3.20 AS flow-base
+FROM alpine:3.21@sha256:21dc6063fd678b478f57c0e13f47560d0ea4eeba26dfc947b2a4f81f686b9f45 AS flow-base
 RUN apk add --no-cache ca-certificates geos && \
   adduser -s /bin/sh -D peerdb
 USER peerdb
@@ -45,6 +45,8 @@ FROM flow-base AS flow-worker
 # Sane defaults for OpenTelemetry
 ENV OTEL_METRIC_EXPORT_INTERVAL=10000
 ENV OTEL_EXPORTER_OTLP_COMPRESSION=gzip
+ARG PEERDB_VERSION_SHA_SHORT
+ENV PEERDB_VERSION_SHA_SHORT=${PEERDB_VERSION_SHA_SHORT}
 
 ENTRYPOINT [\
   "./peer-flow",\
@@ -52,7 +54,20 @@ ENTRYPOINT [\
   ]
 
 FROM flow-base AS flow-snapshot-worker
+
+ARG PEERDB_VERSION_SHA_SHORT
+ENV PEERDB_VERSION_SHA_SHORT=${PEERDB_VERSION_SHA_SHORT}
 ENTRYPOINT [\
   "./peer-flow",\
   "snapshot-worker"\
+  ]
+
+
+FROM flow-base AS flow-maintenance
+
+ARG PEERDB_VERSION_SHA_SHORT
+ENV PEERDB_VERSION_SHA_SHORT=${PEERDB_VERSION_SHA_SHORT}
+ENTRYPOINT [\
+  "./peer-flow",\
+  "maintenance"\
   ]

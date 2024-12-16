@@ -2,11 +2,11 @@ import TitleCase from '@/app/utils/titlecase';
 import { Label } from '@/lib/Label';
 import Link from 'next/link';
 
-const GuideForDestinationSetup = ({
+export default function GuideForDestinationSetup({
   createPeerType: peerType,
 }: {
   createPeerType: string;
-}) => {
+}) {
   const linkForDst = () => {
     switch (peerType) {
       case 'SNOWFLAKE':
@@ -14,14 +14,17 @@ const GuideForDestinationSetup = ({
       case 'BIGQUERY':
         return 'https://docs.peerdb.io/connect/bigquery';
       case 'RDS POSTGRESQL':
+        return 'https://docs.peerdb.io/connect/postgres/rds_postgres';
       case 'POSTGRESQL':
-        return 'https://docs.peerdb.io/connect/rds_postgres';
+        return 'https://docs.peerdb.io/connect/postgres/generic_postgres';
       case 'AZURE FLEXIBLE POSTGRESQL':
-        return 'https://docs.peerdb.io/connect/azure_flexible_server_postgres';
+        return 'https://docs.peerdb.io/connect/postgres/azure_flexible_server_postgres';
       case 'GOOGLE CLOUD POSTGRESQL':
-        return 'https://docs.peerdb.io/connect/cloudsql_postgres';
+        return 'https://docs.peerdb.io/connect/postgres/cloudsql_postgres';
       case 'CRUNCHY POSTGRES':
-        return 'https://docs.peerdb.io/connect/crunchy_bridge';
+        return 'https://docs.peerdb.io/connect/postgres/crunchy_bridge';
+      case 'NEON':
+        return 'https://docs.peerdb.io/connect/postgres/neon_postgres';
       case 'CONFLUENT':
         return 'https://docs.peerdb.io/connect/confluent-cloud';
       case 'REDPANDA':
@@ -45,6 +48,4 @@ const GuideForDestinationSetup = ({
       .
     </Label>
   );
-};
-
-export default GuideForDestinationSetup;
+}

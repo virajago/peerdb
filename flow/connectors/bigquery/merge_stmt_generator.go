@@ -30,11 +30,11 @@ func (m *mergeStmtGenerator) generateFlattenedCTE(dstTable string, normalizedTab
 
 	for _, column := range normalizedTableSchema.Columns {
 		colType := column.Type
-		bqTypeString := qValueKindToBigQueryTypeString(column, true)
+		bqTypeString := qValueKindToBigQueryTypeString(column, normalizedTableSchema.NullableEnabled, true)
 		var castStmt string
 		shortCol := m.shortColumn[column.Name]
 		switch qvalue.QValueKind(colType) {
-		case qvalue.QValueKindJSON, qvalue.QValueKindHStore:
+		case qvalue.QValueKindJSON, qvalue.QValueKindJSONB, qvalue.QValueKindHStore:
 			// if the type is JSON, then just extract JSON
 			castStmt = fmt.Sprintf("CAST(PARSE_JSON(JSON_VALUE(_peerdb_data, '$.%s'),wide_number_mode=>'round') AS %s) AS `%s`",
 				column.Name, bqTypeString, shortCol)
@@ -45,7 +45,7 @@ func (m *mergeStmtGenerator) generateFlattenedCTE(dstTable string, normalizedTab
 		case qvalue.QValueKindArrayFloat32, qvalue.QValueKindArrayFloat64, qvalue.QValueKindArrayInt16,
 			qvalue.QValueKindArrayInt32, qvalue.QValueKindArrayInt64, qvalue.QValueKindArrayString,
 			qvalue.QValueKindArrayBoolean, qvalue.QValueKindArrayTimestamp, qvalue.QValueKindArrayTimestampTZ,
-			qvalue.QValueKindArrayDate:
+			qvalue.QValueKindArrayDate, qvalue.QValueKindArrayUUID:
 			castStmt = fmt.Sprintf("ARRAY(SELECT CAST(element AS %s) FROM "+
 				"UNNEST(CAST(JSON_VALUE_ARRAY(_peerdb_data, '$.%s') AS ARRAY<STRING>)) AS element WHERE element IS NOT null) AS `%s`",
 				bqTypeString, column.Name, shortCol)

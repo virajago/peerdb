@@ -21,7 +21,6 @@ import (
 	metadataStore "github.com/PeerDB-io/peer-flow/connectors/external_metadata"
 	"github.com/PeerDB-io/peer-flow/connectors/utils"
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
 	"github.com/PeerDB-io/peer-flow/model"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
 	"github.com/PeerDB-io/peer-flow/pua"
@@ -34,15 +33,46 @@ type KafkaConnector struct {
 	logger log.Logger
 }
 
+type kgoTemporalLogger struct {
+	log.Logger
+}
+
+func kgoLogger(logger log.Logger) kgo.Logger {
+	if sl, ok := logger.(*slog.Logger); ok {
+		return kslog.New(sl)
+	} else {
+		return kgoTemporalLogger{Logger: logger}
+	}
+}
+
+func (logger kgoTemporalLogger) Level() kgo.LogLevel {
+	return kgo.LogLevelInfo
+}
+
+func (logger kgoTemporalLogger) Log(level kgo.LogLevel, msg string, keyvals ...any) {
+	switch level {
+	case kgo.LogLevelError:
+		logger.Error(msg, keyvals...)
+	case kgo.LogLevelWarn:
+		logger.Warn(msg, keyvals...)
+	case kgo.LogLevelInfo:
+		logger.Info(msg, keyvals...)
+	case kgo.LogLevelDebug:
+		logger.Debug(msg, keyvals...)
+	}
+}
+
 func NewKafkaConnector(
 	ctx context.Context,
+	env map[string]string,
 	config *protos.KafkaConfig,
 ) (*KafkaConnector, error) {
+	logger := shared.LoggerFromCtx(ctx)
 	optionalOpts := append(
 		make([]kgo.Opt, 0, 7),
 		kgo.SeedBrokers(config.Servers...),
 		kgo.AllowAutoTopicCreation(),
-		kgo.WithLogger(kslog.New(slog.Default())), // TODO use logger.LoggerFromCtx
+		kgo.WithLogger(kgoLogger(logger)),
 	)
 	if !config.DisableTls {
 		optionalOpts = append(optionalOpts, kgo.DialTLSConfig(&tls.Config{MinVersion: tls.VersionTLS12}))
@@ -74,7 +104,7 @@ func NewKafkaConnector(
 			return nil, fmt.Errorf("unsupported SASL mechanism: %s", config.Sasl)
 		}
 	}
-	force, err := peerdbenv.PeerDBQueueForceTopicCreation(ctx)
+	force, err := peerdbenv.PeerDBQueueForceTopicCreation(ctx, env)
 	if err == nil && force {
 		optionalOpts = append(optionalOpts, kgo.UnknownTopicRetries(0))
 	}
@@ -92,7 +122,7 @@ func NewKafkaConnector(
 	return &KafkaConnector{
 		PostgresMetadata: pgMetadata,
 		client:           client,
-		logger:           logger.LoggerFromCtx(ctx),
+		logger:           logger,
 	}, nil
 }
 
@@ -119,7 +149,9 @@ func (c *KafkaConnector) SetupMetadataTables(_ context.Context) error {
 	return nil
 }
 
-func (c *KafkaConnector) ReplayTableSchemaDeltas(_ context.Context, flowJobName string, schemaDeltas []*protos.TableSchemaDelta) error {
+func (c *KafkaConnector) ReplayTableSchemaDeltas(_ context.Context, _ map[string]string,
+	flowJobName string, schemaDeltas []*protos.TableSchemaDelta,
+) error {
 	return nil
 }
 
@@ -178,12 +210,13 @@ type poolResult struct {
 
 func (c *KafkaConnector) createPool(
 	ctx context.Context,
+	env map[string]string,
 	script string,
 	flowJobName string,
 	lastSeenLSN *atomic.Int64,
 	queueErr func(error),
 ) (*utils.LPool[poolResult], error) {
-	maxSize, err := peerdbenv.PeerDBQueueParallelism(ctx)
+	maxSize, err := peerdbenv.PeerDBQueueParallelism(ctx, env)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get parallelism: %w", err)
 	}
@@ -213,7 +246,7 @@ func (c *KafkaConnector) createPool(
 				if err != nil {
 					var success bool
 					if errors.Is(err, kerr.UnknownTopicOrPartition) {
-						force, envErr := peerdbenv.PeerDBQueueForceTopicCreation(ctx)
+						force, envErr := peerdbenv.PeerDBQueueForceTopicCreation(ctx, env)
 						if envErr == nil && force {
 							c.logger.Info("[kafka] force topic creation", slog.String("topic", kr.Topic))
 							_, err := kadm.NewClient(c.client).CreateTopic(ctx, 1, 3, nil, kr.Topic)
@@ -250,7 +283,7 @@ func (c *KafkaConnector) SyncRecords(ctx context.Context, req *model.SyncRecords
 
 	queueCtx, queueErr := context.WithCancelCause(ctx)
 
-	pool, err := c.createPool(queueCtx, req.Script, req.FlowJobName, &lastSeenLSN, queueErr)
+	pool, err := c.createPool(queueCtx, req.Env, req.Script, req.FlowJobName, &lastSeenLSN, queueErr)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +292,7 @@ func (c *KafkaConnector) SyncRecords(ctx context.Context, req *model.SyncRecords
 	tableNameRowsMapping := utils.InitialiseTableRowsMap(req.TableMappings)
 	flushLoopDone := make(chan struct{})
 	go func() {
-		flushTimeout, err := peerdbenv.PeerDBQueueFlushTimeoutSeconds(ctx)
+		flushTimeout, err := peerdbenv.PeerDBQueueFlushTimeoutSeconds(ctx, req.Env)
 		if err != nil {
 			c.logger.Warn("[kafka] failed to get flush timeout, no periodic flushing", slog.Any("error", err))
 			return

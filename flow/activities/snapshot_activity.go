@@ -61,7 +61,7 @@ func (a *SnapshotActivity) SetupReplication(
 
 	a.Alerter.LogFlowEvent(ctx, config.FlowJobName, "Started Snapshot Flow Job")
 
-	conn, err := connectors.GetByNameAs[*connpostgres.PostgresConnector](ctx, a.CatalogPool, config.PeerName)
+	conn, err := connectors.GetByNameAs[*connpostgres.PostgresConnector](ctx, nil, a.CatalogPool, config.PeerName)
 	if err != nil {
 		if errors.Is(err, errors.ErrUnsupported) {
 			logger.Info("setup replication is no-op for non-postgres source")
@@ -70,37 +70,23 @@ func (a *SnapshotActivity) SetupReplication(
 		return nil, fmt.Errorf("failed to get connector: %w", err)
 	}
 
-	slotSignal := connpostgres.NewSlotSignal()
-
-	replicationErr := make(chan error)
-	defer close(replicationErr)
-
 	closeConnectionForError := func(err error) {
 		a.Alerter.LogFlowError(ctx, config.FlowJobName, err)
 		// it is important to close the connection here as it is not closed in CloseSlotKeepAlive
 		connectors.CloseConnector(ctx, conn)
 	}
 
-	go func() {
-		if err := conn.SetupReplication(ctx, slotSignal, config); err != nil {
-			closeConnectionForError(err)
-			replicationErr <- err
-		}
-	}()
+	slotSignal := connpostgres.NewSlotSignal()
+	go conn.SetupReplication(ctx, slotSignal, config)
 
 	logger.Info("waiting for slot to be created...")
-	var slotInfo connpostgres.SlotCreationResult
-	select {
-	case slotInfo = <-slotSignal.SlotCreated:
-		logger.Info("slot created", slog.String("SlotName", slotInfo.SlotName))
-	case err := <-replicationErr:
-		closeConnectionForError(err)
-		return nil, fmt.Errorf("failed to setup replication: %w", err)
-	}
+	slotInfo := <-slotSignal.SlotCreated
 
 	if slotInfo.Err != nil {
 		closeConnectionForError(slotInfo.Err)
 		return nil, fmt.Errorf("slot error: %w", slotInfo.Err)
+	} else {
+		logger.Info("slot created", slog.String("SlotName", slotInfo.SlotName))
 	}
 
 	a.SnapshotStatesMutex.Lock()
@@ -120,7 +106,7 @@ func (a *SnapshotActivity) SetupReplication(
 }
 
 func (a *SnapshotActivity) MaintainTx(ctx context.Context, sessionID string, peer string) error {
-	conn, err := connectors.GetByNameAs[connectors.CDCPullConnector](ctx, a.CatalogPool, peer)
+	conn, err := connectors.GetByNameAs[connectors.CDCPullConnector](ctx, nil, a.CatalogPool, peer)
 	if err != nil {
 		return err
 	}
@@ -177,4 +163,12 @@ func (a *SnapshotActivity) WaitForExportSnapshot(ctx context.Context, sessionID 
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+func (a *SnapshotActivity) LoadTableSchema(
+	ctx context.Context,
+	flowName string,
+	tableName string,
+) (*protos.TableSchema, error) {
+	return shared.LoadTableSchemaFromCatalog(ctx, a.CatalogPool, flowName, tableName)
 }

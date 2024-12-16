@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"slices"
 	"time"
 
-	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -28,21 +28,22 @@ const (
 	POSTGRES_15 PGVersion = 150000
 )
 
-func IsUniqueError(err error) bool {
-	var pgerr *pgconn.PgError
-	return errors.As(err, &pgerr) && pgerr.Code == pgerrcode.UniqueViolation
-}
-
-func GetPGConnectionString(pgConfig *protos.PostgresConfig) string {
+func GetPGConnectionString(pgConfig *protos.PostgresConfig, flowName string) string {
 	passwordEscaped := url.QueryEscape(pgConfig.Password)
+	applicationName := "peerdb"
+	if flowName != "" {
+		applicationName = "peerdb_" + flowName
+	}
+
 	// for a url like postgres://user:password@host:port/dbname
 	connString := fmt.Sprintf(
-		"postgres://%s:%s@%s:%d/%s?application_name=peerdb&client_encoding=UTF8",
+		"postgres://%s:%s@%s:%d/%s?application_name=%s&client_encoding=UTF8",
 		pgConfig.User,
 		passwordEscaped,
 		pgConfig.Host,
 		pgConfig.Port,
 		pgConfig.Database,
+		applicationName,
 	)
 	return connString
 }
@@ -57,17 +58,17 @@ func GetCustomDataTypes(ctx context.Context, conn *pgx.Conn) (map[uint32]string,
 		AND n.nspname NOT IN ('pg_catalog', 'information_schema');
 	`)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get custom types: %w", err)
+		return nil, fmt.Errorf("failed to get customTypeMapping: %w", err)
 	}
 
 	customTypeMap := map[uint32]string{}
-	for rows.Next() {
-		var typeID pgtype.Uint32
-		var typeName pgtype.Text
-		if err := rows.Scan(&typeID, &typeName); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
-		}
+	var typeID pgtype.Uint32
+	var typeName pgtype.Text
+	if _, err := pgx.ForEachRow(rows, []any{&typeID, &typeName}, func() error {
 		customTypeMap[typeID.Uint32] = typeName.String
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to scan into customTypeMapping: %w", err)
 	}
 	return customTypeMap, nil
 }
@@ -124,4 +125,28 @@ func UpdateCDCConfigInCatalog(ctx context.Context, pool *pgxpool.Pool,
 
 	logger.Info("synced state to catalog: updated config_proto in flows", slog.String("flowName", cfg.FlowJobName))
 	return nil
+}
+
+func LoadTableSchemaFromCatalog(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	flowName string,
+	tableName string,
+) (*protos.TableSchema, error) {
+	var tableSchemaBytes []byte
+	if err := pool.QueryRow(
+		ctx,
+		"select table_schema from table_schema_mapping where flow_name = $1 and table_name = $2",
+		flowName,
+		tableName,
+	).Scan(&tableSchemaBytes); err != nil {
+		return nil, err
+	}
+	tableSchema := &protos.TableSchema{}
+	return tableSchema, proto.Unmarshal(tableSchemaBytes, tableSchema)
+}
+
+func IsSQLStateError(err error, sqlStates ...string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && slices.Contains(sqlStates, pgErr.Code)
 }

@@ -15,16 +15,12 @@ import (
 	"github.com/PeerDB-io/peer-flow/shared"
 )
 
-const (
-	defaultMaxSyncsPerCdcFlow = 32
-)
-
-func getParallelSyncNormalize(wCtx workflow.Context, logger log.Logger) bool {
+func getParallelSyncNormalize(wCtx workflow.Context, logger log.Logger, env map[string]string) bool {
 	checkCtx := workflow.WithLocalActivityOptions(wCtx, workflow.LocalActivityOptions{
 		StartToCloseTimeout: time.Minute,
 	})
 
-	getParallelFuture := workflow.ExecuteLocalActivity(checkCtx, peerdbenv.PeerDBEnableParallelSyncNormalize)
+	getParallelFuture := workflow.ExecuteLocalActivity(checkCtx, peerdbenv.PeerDBEnableParallelSyncNormalize, env)
 	var parallel bool
 	if err := getParallelFuture.Get(checkCtx, &parallel); err != nil {
 		logger.Warn("Failed to get status of parallel sync-normalize", slog.Any("error", err))
@@ -33,18 +29,18 @@ func getParallelSyncNormalize(wCtx workflow.Context, logger log.Logger) bool {
 	return parallel
 }
 
-func getMaxSyncsPerCDCFlow(wCtx workflow.Context, logger log.Logger) uint32 {
+func getQRepOverwriteFullRefreshMode(wCtx workflow.Context, logger log.Logger, env map[string]string) bool {
 	checkCtx := workflow.WithLocalActivityOptions(wCtx, workflow.LocalActivityOptions{
 		StartToCloseTimeout: time.Minute,
 	})
 
-	getFuture := workflow.ExecuteLocalActivity(checkCtx, peerdbenv.PeerDBMaxSyncsPerCDCFlow)
-	var maxSyncsPerCDCFlow uint32
-	if err := getFuture.Get(checkCtx, &maxSyncsPerCDCFlow); err != nil {
-		logger.Warn("Failed to get max syncs per CDC flow, returning default of 32", slog.Any("error", err))
-		return defaultMaxSyncsPerCdcFlow
+	getFullRefreshFuture := workflow.ExecuteLocalActivity(checkCtx, peerdbenv.PeerDBFullRefreshOverwriteMode, env)
+	var fullRefreshEnabled bool
+	if err := getFullRefreshFuture.Get(checkCtx, &fullRefreshEnabled); err != nil {
+		logger.Warn("Failed to check if full refresh mode is enabled", slog.Any("error", err))
+		return false
 	}
-	return maxSyncsPerCDCFlow
+	return fullRefreshEnabled
 }
 
 func localPeerType(ctx context.Context, name string) (protos.DBType, error) {

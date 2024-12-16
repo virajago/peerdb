@@ -70,16 +70,8 @@ impl FlowGrpcClient {
         let drop_peer_req = pt::peerdb_route::DropPeerRequest {
             peer_name: String::from(peer_name),
         };
-        let response = self.client.drop_peer(drop_peer_req).await?;
-        let drop_response = response.into_inner();
-        if drop_response.ok {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(format!(
-                "failed to drop peer: {:?}",
-                drop_response.error_message
-            )))
-        }
+        self.client.drop_peer(drop_peer_req).await?;
+        Ok(())
     }
 
     pub async fn flow_state_change(
@@ -92,17 +84,10 @@ impl FlowGrpcClient {
             flow_job_name: flow_job_name.to_owned(),
             requested_flow_state: state.into(),
             flow_config_update,
+            drop_mirror_stats: false,
         };
-        let response = self.client.flow_state_change(state_change_req).await?;
-        let state_change_response = response.into_inner();
-        if state_change_response.ok {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(format!(
-                "failed to change the state of flow job {}: {:?}",
-                flow_job_name, state_change_response.error_message
-            )))
-        }
+        self.client.flow_state_change(state_change_req).await?;
+        Ok(())
     }
 
     pub async fn start_peer_flow_job(
@@ -119,6 +104,8 @@ impl FlowGrpcClient {
                 destination_table_identifier: mapping.destination_table_identifier.clone(),
                 partition_key: mapping.partition_key.clone().unwrap_or_default(),
                 exclude: mapping.exclude.clone(),
+                columns: Default::default(),
+                engine: Default::default(),
             })
             .collect::<Vec<_>>();
 
@@ -156,6 +143,7 @@ impl FlowGrpcClient {
             script: job.script.clone(),
             system: system as i32,
             idle_timeout_seconds: job.sync_interval.unwrap_or_default(),
+            env: Default::default(),
         };
 
         if job.disable_peerdb_columns {
@@ -302,16 +290,9 @@ impl FlowGrpcClient {
     pub async fn resync_mirror(&mut self, flow_job_name: &str) -> anyhow::Result<()> {
         let resync_mirror_req = pt::peerdb_route::ResyncMirrorRequest {
             flow_job_name: flow_job_name.to_owned(),
+            drop_stats: true,
         };
-        let response = self.client.resync_mirror(resync_mirror_req).await?;
-        let resync_mirror_response = response.into_inner();
-        if resync_mirror_response.ok {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(format!(
-                "failed to resync mirror for flow job {}: {:?}",
-                flow_job_name, resync_mirror_response.error_message
-            )))
-        }
+        self.client.resync_mirror(resync_mirror_req).await?;
+        Ok(())
     }
 }

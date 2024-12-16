@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"slices"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 
@@ -19,25 +18,25 @@ func (h *FlowRequestHandler) GetDynamicSettings(
 ) (*protos.GetDynamicSettingsResponse, error) {
 	rows, err := h.pool.Query(ctx, "select config_name,config_value from dynamic_settings")
 	if err != nil {
-		slog.Error("[GetDynamicConfigs]: failed to query settings", slog.Any("error", err))
+		slog.Error("[GetDynamicConfigs] failed to query settings", slog.Any("error", err))
 		return nil, err
 	}
-
 	settings := slices.Clone(peerdbenv.DynamicSettings[:])
 	var name string
 	var value string
 	if _, err := pgx.ForEachRow(rows, []any{&name, &value}, func() error {
 		if idx, ok := peerdbenv.DynamicIndex[name]; ok {
 			settings[idx] = shared.CloneProto(settings[idx])
-			settings[idx].Value = &value
+			newValue := value // create a new string reference as value can be overwritten by the next iteration.
+			settings[idx].Value = &newValue
 		}
 		return nil
 	}); err != nil {
-		slog.Error("[GetDynamicConfigs]: failed to collect rows", slog.Any("error", err))
+		slog.Error("[GetDynamicConfigs] failed to collect rows", slog.Any("error", err))
 		return nil, err
 	}
 
-	if peerdbenv.PeerDBAllowedTargets() == strings.ToLower(protos.DBType_CLICKHOUSE.String()) {
+	if peerdbenv.PeerDBOnlyClickHouseAllowed() {
 		filteredSettings := make([]*protos.DynamicSetting, 0)
 		for _, setting := range settings {
 			if setting.TargetForSetting == protos.DynconfTarget_ALL ||
@@ -55,10 +54,9 @@ func (h *FlowRequestHandler) PostDynamicSetting(
 	ctx context.Context,
 	req *protos.PostDynamicSettingRequest,
 ) (*protos.PostDynamicSettingResponse, error) {
-	_, err := h.pool.Exec(ctx, `insert into dynamic_settings (config_name, config_value) values ($1, $2)
-		on conflict (config_name) do update set config_value = $2`, req.Name, req.Value)
+	err := peerdbenv.UpdateDynamicSetting(ctx, h.pool, req.Name, req.Value)
 	if err != nil {
-		slog.Error("[PostDynamicConfig]: failed to execute update setting", slog.Any("error", err))
+		slog.Error("[PostDynamicConfig] failed to execute update setting", slog.Any("error", err))
 		return nil, err
 	}
 	return &protos.PostDynamicSettingResponse{}, nil

@@ -24,7 +24,7 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	"github.com/PeerDB-io/peer-flow/generated/protos"
-	"github.com/PeerDB-io/peer-flow/logger"
+	"github.com/PeerDB-io/peer-flow/middleware"
 	"github.com/PeerDB-io/peer-flow/peerdbenv"
 	"github.com/PeerDB-io/peer-flow/shared"
 	peerflow "github.com/PeerDB-io/peer-flow/workflows"
@@ -33,8 +33,6 @@ import (
 type APIServerParams struct {
 	TemporalHostPort  string
 	TemporalNamespace string
-	TemporalCert      string
-	TemporalKey       string
 	Port              uint16
 	GatewayPort       uint16
 }
@@ -55,7 +53,7 @@ func recryptDatabase(
 	updateSql string,
 ) {
 	newKeyID := peerdbenv.PeerDBCurrentEncKeyID()
-	keys := peerdbenv.PeerDBEncKeys()
+	keys := peerdbenv.PeerDBEncKeys(ctx)
 	if newKeyID == "" {
 		if len(keys) == 0 {
 			slog.Warn("Encryption disabled. This is not recommended.")
@@ -190,31 +188,31 @@ func APIMain(ctx context.Context, args *APIServerParams) error {
 	clientOptions := client.Options{
 		HostPort:  args.TemporalHostPort,
 		Namespace: args.TemporalNamespace,
-		Logger:    slog.New(logger.NewHandler(slog.NewJSONHandler(os.Stdout, nil))),
-	}
-	if args.TemporalCert != "" && args.TemporalKey != "" {
-		slog.Info("Using temporal certificate/key for authentication")
-
-		certs, err := base64DecodeCertAndKey(args.TemporalCert, args.TemporalKey)
-		if err != nil {
-			return fmt.Errorf("unable to base64 decode certificate and key: %w", err)
-		}
-
-		connOptions := client.ConnectionOptions{
-			TLS: &tls.Config{
-				Certificates: certs,
-				MinVersion:   tls.VersionTLS13,
-			},
-		}
-		clientOptions.ConnectionOptions = connOptions
+		Logger:    slog.New(shared.NewSlogHandler(slog.NewJSONHandler(os.Stdout, nil))),
 	}
 
-	tc, err := client.Dial(clientOptions)
+	tc, err := setupTemporalClient(ctx, clientOptions)
 	if err != nil {
 		return fmt.Errorf("unable to create Temporal client: %w", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	authGrpcMiddleware, err := middleware.AuthGrpcMiddleware([]string{
+		grpc_health_v1.Health_Check_FullMethodName,
+		grpc_health_v1.Health_Watch_FullMethodName,
+	})
+	if err != nil {
+		return err
+	}
+
+	requestLoggingMiddleware := middleware.RequestLoggingMiddleWare()
+
+	// Interceptors are executed in the order they are passed to, so unauthorized requests are not logged
+	interceptors := grpc.ChainUnaryInterceptor(
+		authGrpcMiddleware,
+		requestLoggingMiddleware,
+	)
+
+	grpcServer := grpc.NewServer(interceptors)
 
 	catalogPool, err := peerdbenv.GetCatalogConnectionPoolFromEnv(ctx)
 	if err != nil {
@@ -293,4 +291,26 @@ func APIMain(ctx context.Context, args *APIServerParams) error {
 	slog.Info("Server has been shut down gracefully. Exiting...")
 
 	return nil
+}
+
+func setupTemporalClient(ctx context.Context, clientOptions client.Options) (client.Client, error) {
+	if peerdbenv.PeerDBTemporalEnableCertAuth() {
+		slog.Info("Using temporal certificate/key for authentication")
+
+		certs, err := parseTemporalCertAndKey(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("unable to base64 decode certificate and key: %w", err)
+		}
+
+		connOptions := client.ConnectionOptions{
+			TLS: &tls.Config{
+				Certificates: certs,
+				MinVersion:   tls.VersionTLS13,
+			},
+		}
+		clientOptions.ConnectionOptions = connOptions
+	}
+
+	tc, err := client.Dial(clientOptions)
+	return tc, err
 }

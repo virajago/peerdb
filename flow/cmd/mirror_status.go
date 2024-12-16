@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -67,56 +68,31 @@ func (h *FlowRequestHandler) MirrorStatus(
 	workflowID, err := h.getWorkflowID(ctx, req.FlowJobName)
 	if err != nil {
 		slog.Error("unable to get the workflow ID of mirror", slog.Any("error", err))
-		return &protos.MirrorStatusResponse{
-			FlowJobName:      req.FlowJobName,
-			CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-			ErrorMessage:     "unable to get the workflow ID of mirror " + req.FlowJobName,
-			Ok:               false,
-		}, nil
+		return nil, fmt.Errorf("unable to get the workflow ID of mirror %s: %w", req.FlowJobName, err)
 	}
 
 	currState, err := h.getWorkflowStatus(ctx, workflowID)
 	if err != nil {
 		slog.Error("unable to get the running status of mirror", slog.Any("error", err))
-		return &protos.MirrorStatusResponse{
-			FlowJobName:      req.FlowJobName,
-			CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-			ErrorMessage:     "unable to get the running status of mirror " + req.FlowJobName,
-			Ok:               false,
-		}, nil
+		return nil, fmt.Errorf("unable to get the running status of mirror %s: %w", req.FlowJobName, err)
 	}
 
 	createdAt, err := h.getMirrorCreatedAt(ctx, req.FlowJobName)
 	if err != nil {
-		return &protos.MirrorStatusResponse{
-			FlowJobName:      req.FlowJobName,
-			CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-			ErrorMessage:     "unable to get the creation time of mirror " + req.FlowJobName,
-			Ok:               false,
-		}, nil
+		return nil, fmt.Errorf("unable to get the creation time of mirror %s: %w", req.FlowJobName, err)
 	}
 
 	if req.IncludeFlowInfo {
 		cdcFlow, err := h.isCDCFlow(ctx, req.FlowJobName)
 		if err != nil {
 			slog.Error("unable to determine if mirror is cdc", slog.Any("error", err))
-			return &protos.MirrorStatusResponse{
-				FlowJobName:      req.FlowJobName,
-				CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-				ErrorMessage:     "unable to determine if mirror" + req.FlowJobName + "is of type CDC.",
-				Ok:               false,
-			}, nil
+			return nil, fmt.Errorf("unable to determine if mirror %s is of type CDC: %w", req.FlowJobName, err)
 		}
 		if cdcFlow {
 			cdcStatus, err := h.cdcFlowStatus(ctx, req)
 			if err != nil {
 				slog.Error("unable to obtain CDC information for mirror", slog.Any("error", err))
-				return &protos.MirrorStatusResponse{
-					FlowJobName:      req.FlowJobName,
-					CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-					ErrorMessage:     "unable to obtain CDC information for mirror " + req.FlowJobName,
-					Ok:               false,
-				}, nil
+				return nil, fmt.Errorf("unable to obtain CDC information for mirror %s: %w", req.FlowJobName, err)
 			}
 
 			return &protos.MirrorStatusResponse{
@@ -125,19 +101,13 @@ func (h *FlowRequestHandler) MirrorStatus(
 					CdcStatus: cdcStatus,
 				},
 				CurrentFlowState: currState,
-				Ok:               true,
 				CreatedAt:        timestamppb.New(*createdAt),
 			}, nil
 		} else {
 			qrepStatus, err := h.qrepFlowStatus(ctx, req)
 			if err != nil {
 				slog.Error("unable to obtain qrep information for mirror", slog.Any("error", err))
-				return &protos.MirrorStatusResponse{
-					FlowJobName:      req.FlowJobName,
-					CurrentFlowState: protos.FlowStatus_STATUS_UNKNOWN,
-					ErrorMessage:     "unable to obtain snapshot information for mirror " + req.FlowJobName,
-					Ok:               false,
-				}, nil
+				return nil, fmt.Errorf("unable to obtain snapshot information for mirror %s: %w", req.FlowJobName, err)
 			}
 
 			return &protos.MirrorStatusResponse{
@@ -146,7 +116,6 @@ func (h *FlowRequestHandler) MirrorStatus(
 					QrepStatus: qrepStatus,
 				},
 				CurrentFlowState: currState,
-				Ok:               true,
 				CreatedAt:        timestamppb.New(*createdAt),
 			}, nil
 		}
@@ -155,7 +124,6 @@ func (h *FlowRequestHandler) MirrorStatus(
 	return &protos.MirrorStatusResponse{
 		FlowJobName:      req.FlowJobName,
 		CurrentFlowState: currState,
-		Ok:               true,
 		CreatedAt:        timestamppb.New(*createdAt),
 	}, nil
 }
@@ -199,14 +167,27 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		return nil, err
 	}
 
-	cloneStatuses, err := h.cloneTableSummary(ctx, req.FlowJobName)
+	initialLoadResponse, err := h.InitialLoadSummary(ctx, &protos.InitialLoadSummaryRequest{
+		ParentMirrorName: req.FlowJobName,
+	})
 	if err != nil {
 		slog.Error("unable to query clone table summary", slog.Any("error", err))
 		return nil, err
 	}
 
-	cdcBatches, err := h.getCdcBatches(ctx, req.FlowJobName)
-	if err != nil {
+	var cdcBatches []*protos.CDCBatch
+	if !req.ExcludeBatches {
+		cdcBatchesResponse, err := h.GetCDCBatches(ctx, &protos.GetCDCBatchesRequest{FlowJobName: req.FlowJobName})
+		if err != nil {
+			return nil, err
+		}
+		cdcBatches = cdcBatchesResponse.CdcBatches
+	}
+
+	var rowsSynced int64
+	if err := h.pool.QueryRow(ctx,
+		"select coalesce(sum(rows_in_batch), 0) from peerdb_stats.cdc_batches where flow_name=$1", req.FlowJobName,
+	).Scan(&rowsSynced); err != nil {
 		return nil, err
 	}
 
@@ -215,16 +196,50 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		SourceType:      srcType,
 		DestinationType: dstType,
 		SnapshotStatus: &protos.SnapshotStatus{
-			Clones: cloneStatuses,
+			Clones: initialLoadResponse.TableSummaries,
 		},
 		CdcBatches: cdcBatches,
+		RowsSynced: rowsSynced,
 	}, nil
 }
 
-func (h *FlowRequestHandler) cloneTableSummary(
+func (h *FlowRequestHandler) CDCGraph(ctx context.Context, req *protos.GraphRequest) (*protos.GraphResponse, error) {
+	truncField := "minute"
+	switch req.AggregateType {
+	case "1hour":
+		truncField = "hour"
+	case "1day":
+		truncField = "day"
+	case "1month":
+		truncField = "month"
+	}
+	rows, err := h.pool.Query(ctx, `select tm, coalesce(sum(rows_in_batch), 0)
+	from generate_series(date_trunc($2, now() - $1::INTERVAL * 30), now(), $1::INTERVAL) tm
+	left join peerdb_stats.cdc_batches on start_time >= tm and start_time < tm + $1::INTERVAL and flow_name = $3
+	group by 1 order by 1`, req.AggregateType, truncField, req.FlowJobName)
+	if err != nil {
+		return nil, err
+	}
+	data, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.GraphResponseItem, error) {
+		var t time.Time
+		var r int64
+		if err := row.Scan(&t, &r); err != nil {
+			return nil, err
+		}
+		return &protos.GraphResponseItem{Time: float64(t.UnixMilli()), Rows: float64(r)}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &protos.GraphResponse{Data: data}, nil
+}
+
+func (h *FlowRequestHandler) InitialLoadSummary(
 	ctx context.Context,
-	mirrorName string,
-) ([]*protos.CloneTableSummary, error) {
+	req *protos.InitialLoadSummaryRequest,
+) (*protos.InitialLoadSummaryResponse, error) {
+	parentMirrorName := req.ParentMirrorName
 	q := `
 	SELECT
 		distinct qr.flow_name,
@@ -239,7 +254,7 @@ func (h *FlowRequestHandler) cloneTableSummary(
 		AVG(EXTRACT(EPOCH FROM (qp.end_time - qp.start_time)) * 1000) FILTER (WHERE qp.end_time IS NOT NULL) AS AvgTimePerPartitionMs
 	FROM peerdb_stats.qrep_partitions qp
 	RIGHT JOIN peerdb_stats.qrep_runs qr ON qp.flow_name = qr.flow_name
-	WHERE qr.flow_name ^@ ($1||regexp_replace(qr.destination_table, '[^a-zA-Z0-9_]', '_', 'g'))
+	WHERE qr.parent_mirror_name = $1
 	GROUP BY qr.flow_name, qr.destination_table, qr.source_table, qr.start_time, qr.fetch_complete, qr.consolidate_complete;
 	`
 	var flowName pgtype.Text
@@ -253,11 +268,11 @@ func (h *FlowRequestHandler) cloneTableSummary(
 	var numRowsSynced pgtype.Int8
 	var avgTimePerPartitionMs pgtype.Float8
 
-	rows, err := h.pool.Query(ctx, q, fmt.Sprintf("clone_%s_", mirrorName))
+	rows, err := h.pool.Query(ctx, q, parentMirrorName)
 	if err != nil {
 		slog.Error("unable to query initial load partition",
-			slog.String(string(shared.FlowNameKey), mirrorName), slog.Any("error", err))
-		return nil, fmt.Errorf("unable to query initial load partition - %s: %w", mirrorName, err)
+			slog.String(string(shared.FlowNameKey), parentMirrorName), slog.Any("error", err))
+		return nil, fmt.Errorf("unable to query initial load partition - %s: %w", parentMirrorName, err)
 	}
 
 	defer rows.Close()
@@ -276,7 +291,7 @@ func (h *FlowRequestHandler) cloneTableSummary(
 			&numRowsSynced,
 			&avgTimePerPartitionMs,
 		); err != nil {
-			return nil, fmt.Errorf("unable to scan initial load partition - %s: %w", mirrorName, err)
+			return nil, fmt.Errorf("unable to scan initial load partition - %s: %w", parentMirrorName, err)
 		}
 
 		var res protos.CloneTableSummary
@@ -321,11 +336,13 @@ func (h *FlowRequestHandler) cloneTableSummary(
 			res.AvgTimePerPartitionMs = int64(avgTimePerPartitionMs.Float64)
 		}
 
-		res.MirrorName = mirrorName
+		res.MirrorName = parentMirrorName
 
 		cloneStatuses = append(cloneStatuses, &res)
 	}
-	return cloneStatuses, nil
+	return &protos.InitialLoadSummaryResponse{
+		TableSummaries: cloneStatuses,
+	}, nil
 }
 
 func (h *FlowRequestHandler) qrepFlowStatus(
@@ -430,20 +447,7 @@ func (h *FlowRequestHandler) isCDCFlow(ctx context.Context, flowJobName string) 
 }
 
 func (h *FlowRequestHandler) getWorkflowStatus(ctx context.Context, workflowID string) (protos.FlowStatus, error) {
-	res, err := h.temporalClient.QueryWorkflow(ctx, workflowID, "", shared.FlowStatusQuery)
-	if err != nil {
-		slog.Error(fmt.Sprintf("failed to get status in workflow with ID %s: %s", workflowID, err.Error()))
-		return protos.FlowStatus_STATUS_UNKNOWN,
-			fmt.Errorf("failed to get status in workflow with ID %s: %w", workflowID, err)
-	}
-	var state protos.FlowStatus
-	err = res.Get(&state)
-	if err != nil {
-		slog.Error(fmt.Sprintf("failed to get status in workflow with ID %s: %s", workflowID, err.Error()))
-		return protos.FlowStatus_STATUS_UNKNOWN,
-			fmt.Errorf("failed to get status in workflow with ID %s: %w", workflowID, err)
-	}
-	return state, nil
+	return shared.GetWorkflowStatus(ctx, h.temporalClient, workflowID)
 }
 
 func (h *FlowRequestHandler) getCDCWorkflowState(ctx context.Context,
@@ -478,16 +482,43 @@ func (h *FlowRequestHandler) getMirrorCreatedAt(ctx context.Context, flowJobName
 	return &createdAt.Time, nil
 }
 
-func (h *FlowRequestHandler) getCdcBatches(ctx context.Context, flowJobName string) ([]*protos.CDCBatch, error) {
-	q := `SELECT DISTINCT ON(batch_id) batch_id,start_time,end_time,rows_in_batch,batch_start_lsn,batch_end_lsn FROM peerdb_stats.cdc_batches
-	  WHERE flow_name=$1 AND start_time IS NOT NULL ORDER BY batch_id DESC, start_time DESC`
-	rows, err := h.pool.Query(ctx, q, flowJobName)
-	if err != nil {
-		slog.Error(fmt.Sprintf("unable to query cdc batches - %s: %s", flowJobName, err.Error()))
-		return nil, fmt.Errorf("unable to query cdc batches - %s: %w", flowJobName, err)
+func (h *FlowRequestHandler) GetCDCBatches(ctx context.Context, req *protos.GetCDCBatchesRequest) (*protos.GetCDCBatchesResponse, error) {
+	return h.CDCBatches(ctx, req)
+}
+
+func (h *FlowRequestHandler) CDCBatches(ctx context.Context, req *protos.GetCDCBatchesRequest) (*protos.GetCDCBatchesResponse, error) {
+	limitClause := ""
+	if req.Limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", req.Limit)
 	}
 
-	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.CDCBatch, error) {
+	whereExpr := ""
+	queryArgs := append(make([]any, 0, 2), req.FlowJobName)
+
+	sortOrderBy := "desc"
+	if req.BeforeId != 0 || req.AfterId != 0 {
+		if req.BeforeId != -1 {
+			queryArgs = append(queryArgs, req.BeforeId)
+			whereExpr = fmt.Sprintf(" AND batch_id < $%d", len(queryArgs))
+		} else if req.AfterId != -1 {
+			queryArgs = append(queryArgs, req.AfterId)
+			whereExpr = fmt.Sprintf(" AND batch_id > $%d", len(queryArgs))
+			sortOrderBy = "asc"
+		}
+	}
+
+	q := fmt.Sprintf(`SELECT DISTINCT ON(batch_id)
+			batch_id,start_time,end_time,rows_in_batch,batch_start_lsn,batch_end_lsn
+		FROM peerdb_stats.cdc_batches
+		WHERE flow_name=$1 AND start_time IS NOT NULL%s
+		ORDER BY batch_id %s%s`, whereExpr, sortOrderBy, limitClause)
+	rows, err := h.pool.Query(ctx, q, queryArgs...)
+	if err != nil {
+		slog.Error(fmt.Sprintf("unable to query cdc batches - %s: %s", req.FlowJobName, err.Error()))
+		return nil, fmt.Errorf("unable to query cdc batches - %s: %w", req.FlowJobName, err)
+	}
+
+	batches, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.CDCBatch, error) {
 		var batchID pgtype.Int8
 		var startTime pgtype.Timestamp
 		var endTime pgtype.Timestamp
@@ -495,8 +526,8 @@ func (h *FlowRequestHandler) getCdcBatches(ctx context.Context, flowJobName stri
 		var startLSN pgtype.Numeric
 		var endLSN pgtype.Numeric
 		if err := rows.Scan(&batchID, &startTime, &endTime, &numRows, &startLSN, &endLSN); err != nil {
-			slog.Error(fmt.Sprintf("unable to scan cdc batches - %s: %s", flowJobName, err.Error()))
-			return nil, fmt.Errorf("unable to scan cdc batches - %s: %w", flowJobName, err)
+			slog.Error(fmt.Sprintf("unable to scan cdc batches - %s: %s", req.FlowJobName, err.Error()))
+			return nil, fmt.Errorf("unable to scan cdc batches - %s: %w", req.FlowJobName, err)
 		}
 
 		var batch protos.CDCBatch
@@ -522,6 +553,48 @@ func (h *FlowRequestHandler) getCdcBatches(ctx context.Context, flowJobName stri
 
 		return &batch, nil
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	if batches == nil {
+		batches = []*protos.CDCBatch{}
+	}
+	if req.Ascending != (sortOrderBy == "asc") {
+		slices.Reverse(batches)
+	}
+
+	var total int32
+	var rowsBehind int32
+	if len(batches) > 0 {
+		op := '>'
+		if req.Ascending {
+			op = '<'
+		}
+		firstId := batches[0].BatchId
+		if err := h.pool.QueryRow(ctx, fmt.Sprintf(`select count(distinct batch_id), count(distinct batch_id) filter (where batch_id%c$2)
+			from peerdb_stats.cdc_batches where flow_name=$1 and start_time is not null`, op), req.FlowJobName, firstId,
+		).Scan(&total, &rowsBehind); err != nil {
+			return nil, err
+		}
+	} else if err := h.pool.QueryRow(
+		ctx,
+		"select count(distinct batch_id) from peerdb_stats.cdc_batches where flow_name=$1 and start_time is not null",
+		req.FlowJobName,
+	).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	var page int32
+	if req.Limit != 0 {
+		page = rowsBehind/int32(req.Limit) + 1
+	}
+
+	return &protos.GetCDCBatchesResponse{
+		CdcBatches: batches,
+		Total:      total,
+		Page:       page,
+	}, nil
 }
 
 func (h *FlowRequestHandler) CDCTableTotalCounts(
@@ -557,6 +630,10 @@ func (h *FlowRequestHandler) CDCTableTotalCounts(
 	if err != nil {
 		return nil, err
 	}
+
+	if tableCounts == nil {
+		tableCounts = []*protos.CDCTableRowCounts{}
+	}
 	return &protos.CDCTableTotalCountsResponse{TotalData: &totalCount, TablesData: tableCounts}, nil
 }
 
@@ -585,8 +662,8 @@ func (h *FlowRequestHandler) ListMirrorLogs(
 	ctx context.Context,
 	req *protos.ListMirrorLogsRequest,
 ) (*protos.ListMirrorLogsResponse, error) {
-	whereExprs := make([]string, 0, 2)
-	whereArgs := make([]interface{}, 0, 2)
+	whereExprs := make([]string, 0, 3)
+	whereArgs := make([]any, 0, 4)
 	if req.FlowJobName != "" {
 		whereArgs = append(whereArgs, req.FlowJobName)
 		whereExprs = append(whereExprs, "position($1 in flow_name) > 0")
@@ -597,23 +674,47 @@ func (h *FlowRequestHandler) ListMirrorLogs(
 		whereExprs = append(whereExprs, fmt.Sprintf("error_type = $%d", len(whereArgs)))
 	}
 
+	// count query doesn't want paging
+	countWhereArgs := slices.Clone(whereArgs)
+	var countWhereClause string
+	if len(whereExprs) != 0 {
+		countWhereClause = " WHERE " + strings.Join(whereExprs, " AND ")
+	}
+
+	sortOrderBy := "desc"
+	if req.BeforeId != 0 || req.AfterId != 0 {
+		if req.BeforeId != -1 {
+			whereArgs = append(whereArgs, req.BeforeId)
+			whereExprs = append(whereExprs, fmt.Sprintf("id < $%d", len(whereArgs)))
+		} else if req.AfterId != -1 {
+			whereArgs = append(whereArgs, req.AfterId)
+			whereExprs = append(whereExprs, fmt.Sprintf("id > $%d", len(whereArgs)))
+			sortOrderBy = ""
+		}
+	}
+
 	var whereClause string
 	if len(whereExprs) != 0 {
 		whereClause = " WHERE " + strings.Join(whereExprs, " AND ")
 	}
 
-	skip := (req.Page - 1) * req.NumPerPage
-	rows, err := h.pool.Query(ctx, fmt.Sprintf(`select flow_name, error_message, error_type, error_timestamp
-	from peerdb_stats.flow_errors %s
-	order by error_timestamp desc
-	limit %d offset %d`, whereClause, req.NumPerPage, skip), whereArgs...)
+	// page is deprecated
+	var offsetClause string
+	if req.Page != 0 {
+		offsetClause = fmt.Sprintf(" offset %d", (req.Page-1)*req.NumPerPage)
+	}
+
+	rows, err := h.pool.Query(ctx, fmt.Sprintf(`select id, flow_name, error_message, error_type, error_timestamp
+	from peerdb_stats.flow_errors%s
+	order by id %s
+	limit %d%s`, whereClause, sortOrderBy, req.NumPerPage, offsetClause), whereArgs...)
 	if err != nil {
 		return nil, err
 	}
 	mirrorErrors, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.MirrorLog, error) {
 		var log protos.MirrorLog
 		var errorTimestamp time.Time
-		if err := rows.Scan(&log.FlowName, &log.ErrorMessage, &log.ErrorType, &errorTimestamp); err != nil {
+		if err := rows.Scan(&log.Id, &log.FlowName, &log.ErrorMessage, &log.ErrorType, &errorTimestamp); err != nil {
 			return nil, err
 		}
 		log.ErrorTimestamp = float64(errorTimestamp.UnixMilli())
@@ -622,14 +723,37 @@ func (h *FlowRequestHandler) ListMirrorLogs(
 	if err != nil {
 		return nil, err
 	}
+	if sortOrderBy == "" {
+		slices.Reverse(mirrorErrors)
+	}
 
 	var total int32
-	if err := h.pool.QueryRow(ctx, "select count(*) from peerdb_stats.flow_errors"+whereClause, whereArgs...).Scan(&total); err != nil {
+	var rowsBehind int32
+	if len(mirrorErrors) > 0 {
+		firstId := mirrorErrors[0].Id
+		countWhereArgs = append(countWhereArgs, firstId)
+		if err := h.pool.QueryRow(
+			ctx,
+			fmt.Sprintf("select count(*), count(*) filter (where id > $%d) from peerdb_stats.flow_errors%s",
+				len(countWhereArgs), countWhereClause),
+			countWhereArgs...,
+		).Scan(&total, &rowsBehind); err != nil {
+			return nil, err
+		}
+	} else if err := h.pool.QueryRow(
+		ctx, "select count(*) from peerdb_stats.flow_errors"+countWhereClause, countWhereArgs...,
+	).Scan(&total); err != nil {
 		return nil, err
+	}
+
+	page := req.Page
+	if page == 0 && req.NumPerPage != 0 {
+		page = rowsBehind/req.NumPerPage + 1
 	}
 
 	return &protos.ListMirrorLogsResponse{
 		Errors: mirrorErrors,
 		Total:  total,
+		Page:   page,
 	}, nil
 }
